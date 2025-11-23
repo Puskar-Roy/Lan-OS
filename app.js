@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -78,6 +77,12 @@ class GameEngine {
     this.turn = "X";
     this.myRole = null;
   }
+  // FIX: Added missing start method
+  start(myRole) {
+    this.reset();
+    this.active = true;
+    this.myRole = myRole;
+  }
   move(idx, role) {
     if (!this.active || this.board[idx]) return false;
     if (role === this.myRole && this.turn !== this.myRole) return false;
@@ -103,7 +108,7 @@ class GameEngine {
         this.board[c[0]] === this.board[c[2]]
       )
         return this.board[c[0]];
-    return !this.board.includes(null) ? "DRAW" : null;
+    return !this.board.includes(null) && this.active ? "DRAW" : null;
   }
 }
 
@@ -139,6 +144,7 @@ class NetworkNode extends EventEmitter {
     }, CONFIG.PING_INTERVAL);
 
     this.wss.on("connection", (ws) => this._handleConn(ws));
+
     server.listen(this.port, "0.0.0.0", () => {
       this._startDiscovery();
       this.emit("ready", this.port);
@@ -172,10 +178,9 @@ class NetworkNode extends EventEmitter {
   }
 
   connect(id) {
-    if (this.conns.has(id)) return; // Prevent duplicate connections
+    if (this.conns.has(id)) return;
     const p = this.peers.get(id);
     if (!p) return;
-
     const ws = new WebSocket(`ws://${p.address}:${p.port}`);
     ws.on("error", (e) =>
       this.emit(
@@ -183,7 +188,6 @@ class NetworkNode extends EventEmitter {
         `${COLORS.err}Connect Failed: ${e.message}${COLORS.reset}`
       )
     );
-
     ws.on("open", () => {
       this._send(ws, "pair", {
         fromId: this.identity.id,
@@ -209,13 +213,12 @@ class NetworkNode extends EventEmitter {
         }
         return;
       }
-
       try {
         const { type, payload } = JSON.parse(data.toString());
-
         switch (type) {
           case "pair":
             peerId = payload.fromId;
+            // Update existing if reconnecting
             this.conns.set(peerId, { ws, meta: payload, isAlive: true });
             this.emit("conns_update");
             if (!payload.ack)
@@ -278,7 +281,8 @@ class NetworkNode extends EventEmitter {
               "log",
               `${COLORS.dm}INVITE: ${payload.name} wants to play! Type /accept${COLORS.reset}`
             );
-            this.activeTarget = payload.fromId;
+            this.activeTarget = payload.fromId; // Switch context to sender
+            this.emit("target_changed", this.activeTarget); // Notify UI
             break;
           case "game-start":
             this.game.start(payload.role || "X");
@@ -303,6 +307,14 @@ class NetworkNode extends EventEmitter {
       if (peerId) {
         this.conns.delete(peerId);
         this.emit("conns_update");
+        if (this.activeTarget === peerId) {
+          this.activeTarget = "general";
+          this.emit("target_changed", "general");
+          this.emit(
+            "log",
+            `${COLORS.err}Target disconnected. Switched to General.${COLORS.reset}`
+          );
+        }
       }
     });
   }
@@ -313,6 +325,7 @@ class NetworkNode extends EventEmitter {
   }
 
   processInput(text) {
+    if (!text) return;
     if (text === "/help") return this._showHelp();
     if (text.startsWith("/play")) return this._invite();
     if (text.startsWith("/accept")) return this._accept();
@@ -344,6 +357,7 @@ class NetworkNode extends EventEmitter {
         this.emit("chat", { name: `-> ${t.meta.name}`, text, isPm: true });
       } else {
         this.activeTarget = "general";
+        this.emit("target_changed", "general");
         this.emit(
           "log",
           `${COLORS.err}User gone. Switched to General.${COLORS.reset}`
@@ -402,7 +416,6 @@ class NetworkNode extends EventEmitter {
       );
     const { fromId, cmd } = this.pendingShell;
     const t = this.conns.get(fromId);
-
     this.emit("log", `${COLORS.sys}Executing: ${cmd}${COLORS.reset}`);
     exec(cmd, (err, stdout, stderr) => {
       const output = err ? stderr : stdout;
@@ -425,18 +438,15 @@ class NetworkNode extends EventEmitter {
         "log",
         `${COLORS.err}Select a DM to send files.${COLORS.reset}`
       );
-
     const fileId = uuidv4();
     const stats = fs.statSync(filePath);
     const filename = path.basename(filePath);
-
     this._send(target.ws, "file-offer", {
       fileId,
       filename,
       size: stats.size,
       fromId: this.identity.id,
     });
-
     const stream = fs.createReadStream(filePath, {
       highWaterMark: CONFIG.CHUNK_SIZE,
     });
@@ -458,6 +468,11 @@ class NetworkNode extends EventEmitter {
         name: this.identity.username,
       });
       this.emit("log", "Invite sent.");
+    } else {
+      this.emit(
+        "log",
+        `${COLORS.err}You must be in a DM to play.${COLORS.reset}`
+      );
     }
   }
 
@@ -519,6 +534,7 @@ class NetworkNode extends EventEmitter {
     mouse: true,
     border: "line",
   });
+
   const connList = grid.set(6, 0, 6, 3, blessed.list, {
     label: " 2. Chats ",
     style: { selected: { bg: "magenta" } },
@@ -526,21 +542,25 @@ class NetworkNode extends EventEmitter {
     mouse: true,
     border: "line",
   });
+
   const logBox = grid.set(0, 3, 10, 6, blessed.log, {
-    label: " Chat ",
+    label: " Chat: #General ",
     tags: true,
     scrollbar: { bg: "blue" },
     border: "line",
   });
+
   const gameBox = grid.set(0, 9, 6, 3, blessed.box, {
     label: " Game ",
     border: "line",
   });
+
   const sysBox = grid.set(6, 9, 6, 3, blessed.log, {
     label: " System ",
     tags: true,
     border: "line",
   });
+
   const inputBox = grid.set(10, 3, 2, 6, blessed.box, {
     label: " Input ",
     border: { type: "line", fg: "green" },
@@ -570,7 +590,13 @@ class NetworkNode extends EventEmitter {
 
   const renderInput = () => {
     inputBox.setContent(" > " + inputBuffer + "_");
-    inputBox.style.border.fg = inInputMode ? "green" : "white";
+    // Visual cue for input mode: Green border for #General, Cyan for DM
+    const isGeneral = node.activeTarget === "general";
+    inputBox.style.border.fg = inInputMode
+      ? isGeneral
+        ? "green"
+        : "cyan"
+      : "white";
     screen.render();
   };
 
@@ -592,6 +618,7 @@ class NetworkNode extends EventEmitter {
     }, 50);
   };
 
+  // KEY HANDLER
   screen.on("keypress", (ch, key) => {
     if (key.name === "tab") {
       focusIndex = (focusIndex + 1) % 3;
@@ -621,28 +648,30 @@ class NetworkNode extends EventEmitter {
     }
   });
 
+  // PEER SELECTION
   peerList.on("select", (item, i) => {
     const p = Array.from(node.peers.values())[i];
     if (p) {
-      sysBox.log(`Connecting...`);
+      sysBox.log(`Connecting to ${p.name}...`);
       node.connect(p.id);
     }
+    // Reset focus to input after clicking
     focusIndex = 0;
     inInputMode = true;
     inputBox.focus();
     renderInput();
   });
 
-  connList.on("select", (item) => {
-    const name = item.content;
-    if (name.includes("#General")) {
+  // CHAT SELECTION FIX
+  connList.on("select", (item, i) => {
+    // i=0 is #General
+    if (i === 0) {
       node.activeTarget = "general";
       logBox.setLabel(" Chat: #General ");
     } else {
-      // FIX: Strict matching for reliability
-      const t = Array.from(node.conns.values()).find(
-        (c) => c.meta.name === name
-      );
+      // FIX: Use index to find connection instead of unstable string matching
+      const connections = Array.from(node.conns.values());
+      const t = connections[i - 1];
       if (t) {
         node.activeTarget = t.meta.fromId;
         logBox.setLabel(` Chat: @${t.meta.name} `);
@@ -654,6 +683,7 @@ class NetworkNode extends EventEmitter {
     renderInput();
   });
 
+  // UI UPDATES
   node.on("log", (m) => {
     sysBox.log(m);
     screen.render();
@@ -678,6 +708,16 @@ class NetworkNode extends EventEmitter {
       ...Array.from(node.conns.values()).map((x) => x.meta.name),
     ]);
     screen.render();
+  });
+  // Handle automatic target changes (e.g. receiving invite)
+  node.on("target_changed", (targetId) => {
+    if (targetId === "general") {
+      logBox.setLabel(" Chat: #General ");
+    } else {
+      const t = node.conns.get(targetId);
+      if (t) logBox.setLabel(` Chat: @${t.meta.name} `);
+    }
+    renderInput();
   });
   node.on("game_update", () => {
     node.game.board.forEach((v, i) => {
