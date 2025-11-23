@@ -18,8 +18,9 @@ const CONFIG = {
   SERVICE_TYPE: "lanos_omega_v12",
   DIR_RECEIVE: path.resolve(process.cwd(), "received_files"),
   CONFIG_FILE: path.resolve(process.cwd(), "lan-identity.json"),
-  // FIX: Increased interval to 10s to prevent auto-disconnects on laggy wifi
-  PING_INTERVAL: 10000,
+  // Check often (5s) but don't kill until TIMEOUT (30s)
+  PING_INTERVAL: 5000,
+  CONNECTION_TIMEOUT: 30000, // 30 Seconds tolerance
   CHUNK_SIZE: 16 * 1024,
 };
 
@@ -146,22 +147,23 @@ class NetworkNode extends EventEmitter {
     });
     this.wss = new WebSocketServer({ server });
 
-    // FIX: Heartbeat Logic - Less Aggressive
+    // FIX: STABLE HEARTBEAT SYSTEM
     setInterval(() => {
+      const now = Date.now();
       this.conns.forEach((c, id) => {
-        if (c.isAlive === false) {
+        // If we haven't heard from them in 30 seconds, THEN kill.
+        if (now - c.lastSeen > CONFIG.CONNECTION_TIMEOUT) {
           this.emit(
             "log",
-            `${COLORS.err}Dropping dead connection: ${c.meta.name}${COLORS.reset}`
+            `${COLORS.err}Timed out: ${c.meta.name} (No response for 30s)${COLORS.reset}`
           );
           return c.ws.terminate();
         }
-        c.isAlive = false;
+
+        // Otherwise, send a ping to keep TCP alive
         try {
           c.ws.ping();
-        } catch (e) {
-          // Socket might be closing already, ignore
-        }
+        } catch (e) {}
       });
     }, CONFIG.PING_INTERVAL);
 
@@ -209,28 +211,19 @@ class NetworkNode extends EventEmitter {
 
   connect(id) {
     if (this.conns.has(id)) {
-      this.emit(
-        "log",
-        `${COLORS.sys}Already connected to this user.${COLORS.reset}`
-      );
+      this.emit("log", `${COLORS.sys}Already connected.${COLORS.reset}`);
       return;
     }
     const p = this.peers.get(id);
     if (!p) return;
 
-    this.emit(
-      "log",
-      `${COLORS.sys}Dialing ${p.address}:${p.port}...${COLORS.reset}`
-    );
+    this.emit("log", `${COLORS.sys}Dialing ${p.address}...${COLORS.reset}`);
     const ws = new WebSocket(`ws://${p.address}:${p.port}`);
 
     const timeout = setTimeout(() => {
       if (ws.readyState !== WebSocket.OPEN) {
         ws.terminate();
-        this.emit(
-          "log",
-          `${COLORS.err}Connection timed out (5s).${COLORS.reset}`
-        );
+        this.emit("log", `${COLORS.err}Connection timed out.${COLORS.reset}`);
       }
     }, 5000);
 
@@ -244,30 +237,37 @@ class NetworkNode extends EventEmitter {
 
     ws.on("open", () => {
       clearTimeout(timeout);
-      // FIX: Mark alive immediately so it doesn't get killed by heartbeat
-      ws.isAlive = true;
       this._send(ws, "pair", {
         fromId: this.identity.id,
         name: this.identity.username,
       });
       this._handleConn(ws);
-      this.emit(
-        "log",
-        `${COLORS.me}Socket Open. Handshaking...${COLORS.reset}`
-      );
+      this.emit("log", `${COLORS.me}Connected! Verifying...${COLORS.reset}`);
     });
   }
 
   _handleConn(ws) {
     let peerId = null;
     ws.binaryType = "arraybuffer";
-    ws.isAlive = true;
 
+    // FIX: Initialize lastSeen to NOW so it doesn't die immediately
+    let connectionData = {
+      ws,
+      meta: { name: "Unknown" },
+      lastSeen: Date.now(),
+    };
+
+    // FIX: Update lastSeen on ANY activity (Pong or Message)
     ws.on("pong", () => {
-      ws.isAlive = true;
+      if (this.conns.has(peerId)) this.conns.get(peerId).lastSeen = Date.now();
     });
 
     ws.on("message", (data, isBinary) => {
+      // Update activity timestamp
+      if (peerId && this.conns.has(peerId)) {
+        this.conns.get(peerId).lastSeen = Date.now();
+      }
+
       if (isBinary) {
         const parsed = Protocol.parseBinary(Buffer.from(data));
         if (parsed && this.transfers.has(parsed.header.fileId)) {
@@ -280,20 +280,14 @@ class NetworkNode extends EventEmitter {
         switch (type) {
           case "pair":
             peerId = payload.fromId;
-            // FIX: If we are already connected, don't overwrite blindly
-            if (this.conns.has(peerId)) {
-              // Keep the fresher connection or just update metadata
-              const existing = this.conns.get(peerId);
-              existing.ws = ws;
-              existing.isAlive = true;
-            } else {
-              this.conns.set(peerId, { ws, meta: payload, isAlive: true });
-            }
+            // Update connection map with real ID and Name
+            connectionData.meta = payload;
+            this.conns.set(peerId, connectionData);
 
             this.emit("conns_update");
             this.emit(
               "log",
-              `${COLORS.me}Connected to ${payload.name}${COLORS.reset}`
+              `${COLORS.me}Linked with ${payload.name}${COLORS.reset}`
             );
 
             if (!payload.ack)
@@ -379,18 +373,15 @@ class NetworkNode extends EventEmitter {
     });
 
     ws.on("close", (code, reason) => {
-      if (peerId) {
-        // Only log if it was actually in our list
-        if (this.conns.has(peerId)) {
-          this.emit(
-            "log",
-            `${COLORS.err}${
-              this.conns.get(peerId).meta.name
-            } Disconnected (Code: ${code})${COLORS.reset}`
-          );
-          this.conns.delete(peerId);
-          this.emit("conns_update");
-        }
+      if (peerId && this.conns.has(peerId)) {
+        this.emit(
+          "log",
+          `${COLORS.err}${this.conns.get(peerId).meta.name} Disconnected.${
+            COLORS.reset
+          }`
+        );
+        this.conns.delete(peerId);
+        this.emit("conns_update");
 
         if (this.activeTarget === peerId) {
           this.activeTarget = "general";
@@ -401,8 +392,7 @@ class NetworkNode extends EventEmitter {
     });
 
     ws.on("error", (e) => {
-      // Just log, close will handle cleanup
-      // this.emit("log", `${COLORS.err}Socket Error: ${e.message}${COLORS.reset}`);
+      // Silently handle errors, let close event handle cleanup
     });
   }
 
@@ -410,9 +400,7 @@ class NetworkNode extends EventEmitter {
     try {
       if (ws.readyState === WebSocket.OPEN)
         ws.send(JSON.stringify({ type, payload }));
-    } catch (e) {
-      this.emit("log", `${COLORS.err}Send failed.${COLORS.reset}`);
-    }
+    } catch (e) {}
   }
 
   processInput(text) {
@@ -438,10 +426,7 @@ class NetworkNode extends EventEmitter {
         count++;
       });
       if (count === 0 && this.conns.size === 0) {
-        this.emit(
-          "log",
-          `${COLORS.err}No one is online to hear you.${COLORS.reset}`
-        );
+        this.emit("log", `${COLORS.err}No one is connected.${COLORS.reset}`);
       }
       this.emit("chat", { name: "Me", text, isPm: false });
     } else {
