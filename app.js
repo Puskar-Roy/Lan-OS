@@ -1,16 +1,5 @@
 #!/usr/bin/env node
 
-/**
- * LAN-OS OMEGA (v11.0)
- * Features:
- * - Real-time Messaging (DM/Global)
- * - File Transfer
- * - Tic-Tac-Toe
- * - Nudge (Screen Shake)
- * - Secure Remote Shell
- * - Input Glitch Fixes
- */
-
 import fs from "fs";
 import path from "path";
 import os from "os";
@@ -24,7 +13,7 @@ import contrib from "blessed-contrib";
 import inquirer from "inquirer";
 import { exec } from "child_process";
 
-// --- CONFIGURATION ---
+
 const CONFIG = {
   PORT_RANGE: { min: 9000, max: 9999 },
   SERVICE_TYPE: "lanos_omega_v11",
@@ -37,7 +26,7 @@ const CONFIG = {
 if (!fs.existsSync(CONFIG.DIR_RECEIVE))
   fs.mkdirSync(CONFIG.DIR_RECEIVE, { recursive: true });
 
-// --- UTILITIES ---
+
 const getIP = () =>
   Object.values(os.networkInterfaces())
     .flat()
@@ -54,7 +43,7 @@ const COLORS = {
   reset: "{/}",
 };
 
-// --- PROTOCOL ---
+
 class Protocol {
   static createBinary(fileId, chunk) {
     const header = JSON.stringify({ fileId });
@@ -78,7 +67,7 @@ class Protocol {
   }
 }
 
-// --- GAME LOGIC ---
+
 class GameEngine {
   constructor() {
     this.reset();
@@ -118,7 +107,7 @@ class GameEngine {
   }
 }
 
-// --- NETWORK CORE ---
+
 class NetworkNode extends EventEmitter {
   constructor(identity) {
     super();
@@ -131,8 +120,8 @@ class NetworkNode extends EventEmitter {
     this.bonjour = Bonjour();
     this.activeTarget = "general";
 
-    // Security State for Shell
-    this.pendingShell = null; // { fromId: string, cmd: string }
+   
+    this.pendingShell = null; 
   }
 
   start() {
@@ -142,7 +131,7 @@ class NetworkNode extends EventEmitter {
     });
     this.wss = new WebSocketServer({ server });
 
-    // Heartbeat
+    
     setInterval(() => {
       this.conns.forEach((c) => {
         if (c.isAlive === false) return c.ws.terminate();
@@ -234,12 +223,12 @@ class NetworkNode extends EventEmitter {
             this.emit("chat", payload);
             break;
 
-          // --- NUDGE ---
+          
           case "nudge":
             this.emit("nudge_event", payload.fromName);
             break;
 
-          // --- REMOTE SHELL ---
+          
           case "shell-req":
             this.pendingShell = { fromId: payload.fromId, cmd: payload.cmd };
             this.emit(
@@ -259,7 +248,7 @@ class NetworkNode extends EventEmitter {
             );
             break;
 
-          // --- FILES ---
+          
           case "file-offer":
             this.emit(
               "log",
@@ -287,7 +276,7 @@ class NetworkNode extends EventEmitter {
             }
             break;
 
-          // --- GAME ---
+          
           case "game-invite":
             this.emit(
               "log",
@@ -327,7 +316,7 @@ class NetworkNode extends EventEmitter {
       ws.send(JSON.stringify({ type, payload }));
   }
 
-  // --- COMMAND PROCESSOR ---
+
   processInput(text) {
     if (text === "/help") return this._showHelp();
     if (text.startsWith("/play")) return this._invite();
@@ -338,7 +327,7 @@ class NetworkNode extends EventEmitter {
     if (text.startsWith("/exec ")) return this._requestShell(text.slice(6));
     if (text === "/allow") return this._approveShell();
 
-    // Standard Chat
+   
     if (this.activeTarget === "general") {
       this.conns.forEach((c) =>
         this._send(c.ws, "msg", {
@@ -506,7 +495,7 @@ class NetworkNode extends EventEmitter {
   }
 }
 
-// --- UI ---
+
 (async () => {
   let identity;
   if (fs.existsSync(CONFIG.CONFIG_FILE))
@@ -525,13 +514,12 @@ class NetworkNode extends EventEmitter {
 
   const node = new NetworkNode(identity);
 
-  // UI SETUP
   const screen = blessed.screen({ smartCSR: true, title: "LAN-OS OMEGA" });
-  screen.program.echo = false; // Fix ghost typing
+  screen.program.echo = false; 
 
   const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
 
-  // WIDGETS
+
   const peerList = grid.set(0, 0, 6, 3, blessed.list, {
     label: " 1. Online ",
     style: { selected: { bg: "blue" } },
@@ -594,12 +582,12 @@ class NetworkNode extends EventEmitter {
     screen.render();
   };
 
-  // NUDGE ANIMATION
+ 
   const doShake = () => {
-    // Sound bell
+   
     process.stdout.write("\x07");
 
-    // Visual Shake (Offsets)
+    
     let count = 0;
     const interval = setInterval(() => {
       const offset = count % 2 === 0 ? 1 : 0;
@@ -609,8 +597,8 @@ class NetworkNode extends EventEmitter {
       count++;
       if (count > 6) {
         clearInterval(interval);
-        logBox.top = 0; // Grid reset logic is complex in blessed-contrib,
-        logBox.left = 3; // so we manually reset the main logbox position
+        logBox.top = 0; 
+        logBox.left = 3; 
         screen.render();
       }
     }, 50);
@@ -643,7 +631,7 @@ class NetworkNode extends EventEmitter {
     }
   });
 
-  // WIRING
+ 
   peerList.on("select", (item, i) => {
     const p = Array.from(node.peers.values())[i];
     if (p) {
