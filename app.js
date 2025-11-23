@@ -15,7 +15,7 @@ import inquirer from "inquirer";
 // --- CONFIG ---
 const CONFIG = {
   PORT_RANGE: { min: 9000, max: 9999 },
-  SERVICE_TYPE: "lanos_v6_fix",
+  SERVICE_TYPE: "lanos_v6_final",
   DIR_RECEIVE: path.resolve(process.cwd(), "received"),
   CONFIG_FILE: path.resolve(process.cwd(), "lan-os-config.json"),
   CHUNK_SIZE: 16 * 1024,
@@ -71,7 +71,7 @@ async function loadOrSetupIdentity() {
   return identity;
 }
 
-// --- WEB CLIENT (MOBILE) ---
+// --- WEB CLIENT ---
 const WEB_CLIENT_HTML = `
 <!DOCTYPE html>
 <html lang="en">
@@ -90,7 +90,7 @@ const WEB_CLIENT_HTML = `
     </style>
 </head>
 <body>
-    <div id="login"><h2>LAN-OS v6</h2><input id="u" placeholder="Name"><br><button onclick="join()">JOIN GENERAL</button></div>
+    <div id="login"><h2>LAN-OS Mobile</h2><input id="u" placeholder="Name"><br><button onclick="join()">JOIN</button></div>
     <div id="app"><div id="header">Channel: #General</div><div id="log"></div><div id="ctrl"><input id="i"><button onclick="send()">Send</button></div></div>
     <script>
         let ws, id = Math.random().toString(36).substr(2), name;
@@ -107,7 +107,6 @@ const WEB_CLIENT_HTML = `
                 try {
                     const {type, payload} = JSON.parse(e.data);
                     if(type==='msg') log(\`[\${payload.name}]: \${payload.text}\`, payload.isPm ? '#f0f' : '#fff');
-                    if(type==='game-invite') log('Game Invite received! (Games restricted to Desktop)', 'red');
                 } catch(x){}
             };
         }
@@ -160,7 +159,7 @@ class TicTacToe {
   }
 }
 
-// --- NODE (The Engine) ---
+// --- NODE ENGINE ---
 class LanPeer extends EventEmitter {
   constructor(identity) {
     super();
@@ -252,21 +251,20 @@ class LanPeer extends EventEmitter {
           } else if (type === "msg") {
             const sender =
               this.conns.get(payload.fromId)?.meta.name || "Unknown";
-            if (payload.isPm) {
+            if (payload.isPm)
               this.emit(
                 "log",
                 `{magenta-fg}[DM ${sender}]: ${payload.text}{/}`
               );
-            } else {
+            else
               this.emit(
                 "log",
                 `{cyan-fg}[#General ${sender}]:{/} ${payload.text}`
               );
-            }
           } else if (type === "file-offer") {
             this.emit(
               "log",
-              `{yellow-fg}Receiving file from ${payload.fromName}: ${payload.filename}{/}`
+              `{yellow-fg}Receiving file: ${payload.filename}{/}`
             );
             const fpath = path.join(
               CONFIG.DIR_RECEIVE,
@@ -313,6 +311,15 @@ class LanPeer extends EventEmitter {
   }
 
   sendMsg(text) {
+    // GUARD: Check if connections exist
+    if (this.conns.size === 0) {
+      this.emit(
+        "log",
+        `{red-fg}[!] No connection. Click a peer in List 1 first!{/}`
+      );
+      return;
+    }
+
     if (this.activeChannel === "general") {
       this.conns.forEach((c) =>
         c.ws.send(
@@ -344,7 +351,7 @@ class LanPeer extends EventEmitter {
         );
         this.emit("log", `{magenta-fg}[DM -> ${target.meta.name}]: ${text}{/}`);
       } else {
-        this.emit("log", `{red-fg}User not connected. Switched to General.{/}`);
+        this.emit("log", `{red-fg}User left. Switched to General.{/}`);
         this.activeChannel = "general";
       }
     }
@@ -359,6 +366,7 @@ class LanPeer extends EventEmitter {
         : [this.conns.get(this.activeChannel)].filter(Boolean);
     if (targets.length === 0)
       return this.emit("log", `{red-fg}No one to receive file.{/}`);
+
     const fname = path.basename(fpath);
     const fsize = fs.statSync(fpath).size;
     const fid = uuidv4();
@@ -376,25 +384,20 @@ class LanPeer extends EventEmitter {
         })
       )
     );
+
     const stream = fs.createReadStream(fpath, {
       highWaterMark: CONFIG.CHUNK_SIZE,
     });
-    stream.on("data", (chunk) => {
-      const bin = Protocol.createBinary(fid, chunk);
-      targets.forEach((t) => t.ws.send(bin));
-    });
+    stream.on("data", (chunk) =>
+      targets.forEach((t) => t.ws.send(Protocol.createBinary(fid, chunk)))
+    );
     stream.on("end", () => {
       targets.forEach((t) =>
         t.ws.send(
           JSON.stringify({ type: "file-end", payload: { fileId: fid } })
         )
       );
-      this.emit(
-        "log",
-        `{green-fg}Sent: ${fname} to ${
-          this.activeChannel === "general" ? "everyone" : "peer"
-        }{/}`
-      );
+      this.emit("log", `{green-fg}Sent: ${fname}{/}`);
     });
   }
 
@@ -415,12 +418,7 @@ class LanPeer extends EventEmitter {
         })
       )
     );
-    this.emit(
-      "log",
-      `Invited ${
-        this.activeChannel === "general" ? "everyone" : "peer"
-      } to Game.`
-    );
+    this.emit("log", `Invited to Game.`);
   }
 
   accept() {
@@ -476,25 +474,28 @@ class LanPeer extends EventEmitter {
 
   const screen = blessed.screen({
     smartCSR: false,
-    title: `LAN-OS v6`,
+    title: `LAN-OS v6.2`,
     fullUnicode: true,
   });
+  // Disable local echo to prevent double typing
+  screen.program.echo = false;
+
   const grid = new contrib.grid({ rows: 12, cols: 12, screen });
 
   // Layout
   const pList = grid.set(0, 0, 8, 3, blessed.list, {
-    label: " 1. Discovered ",
+    label: " 1. Discovered Peers (Click to Connect) ",
     keys: true,
     mouse: true,
-    style: { selected: { bg: "blue" } },
-    border: "line",
+    style: { selected: { bg: "blue" }, item: { fg: "white" } },
+    border: { type: "line", fg: "white" },
   });
   const cList = grid.set(8, 0, 4, 3, blessed.list, {
-    label: " 2. Chats ",
+    label: " 2. Active Chats (Click to Switch) ",
     keys: true,
     mouse: true,
-    style: { selected: { bg: "magenta" } },
-    border: "line",
+    style: { selected: { bg: "magenta" }, item: { fg: "white" } },
+    border: { type: "line", fg: "white" },
   });
   const logBox = grid.set(0, 3, 8, 6, blessed.log, {
     label: ` Chat: #General `,
@@ -508,10 +509,10 @@ class LanPeer extends EventEmitter {
     border: "line",
   });
 
-  // FIX: Using a dumb BOX instead of Textbox to prevent double typing
+  // DUMB BOX for Input (Prevents double typing)
   const inputBox = grid.set(8, 3, 4, 9, blessed.box, {
-    label: " Message (Type here) ",
-    border: "line",
+    label: " Message (Click here to type) ",
+    border: { type: "line", fg: "white" },
     style: { bg: "black", fg: "white" },
   });
 
@@ -579,54 +580,77 @@ class LanPeer extends EventEmitter {
     screen.render();
   });
 
-  // --- MANUAL INPUT HANDLER (THE FIX) ---
+  // --- STRICT FOCUS & INPUT HANDLING ---
   let currentInput = "";
+  let isInputMode = true; // Default to typing mode
 
-  const updateInput = () => {
-    inputBox.setContent(currentInput + "_"); // Add cursor
+  const renderInput = () => {
+    inputBox.setContent(currentInput + "_");
+    // Visual feedback for modes
+    if (isInputMode) {
+      inputBox.style.border.fg = "green";
+      inputBox.setLabel(" Message (Typing...) ");
+    } else {
+      inputBox.style.border.fg = "white";
+      inputBox.setLabel(" Message (Paused - Select List) ");
+    }
     screen.render();
   };
 
+  // Click handler to enable typing
+  inputBox.on("click", () => {
+    isInputMode = true;
+    renderInput();
+  });
+
+  // Click handlers for lists to disable typing (so arrows work)
+  pList.on("focus", () => {
+    isInputMode = false;
+    renderInput();
+  });
+  cList.on("focus", () => {
+    isInputMode = false;
+    renderInput();
+  });
+
   screen.on("keypress", (ch, key) => {
-    // Handle Global Exit
     if (key.name === "c" && key.ctrl) process.exit(0);
 
-    // Handle Tab Switching
-    if (key.name === "tab") {
-      screen.focusNext();
-      screen.render();
+    // If user presses Tab or Clicked a list, let Blessed handle navigation
+    if (!isInputMode) {
+      if (key.name === "i" || key.name === "enter") {
+        isInputMode = true;
+        renderInput();
+      } // Shortcut to start typing
       return;
     }
 
-    // Handle Input Logic (Only if inputBox is focused)
-    // Note: We assume input is focused if lists aren't
-    if (
-      inputBox === screen.focused ||
-      (screen.focused !== pList && screen.focused !== cList)
-    ) {
-      if (key.name === "return" || key.name === "enter") {
-        if (!currentInput) return;
-        const val = currentInput;
-        currentInput = "";
-        updateInput();
+    // Input Mode Logic
+    if (key.name === "return" || key.name === "enter") {
+      if (!currentInput) return;
+      const val = currentInput;
+      currentInput = "";
+      renderInput();
 
-        if (val.startsWith("/play")) node.invite();
-        else if (val.startsWith("/accept")) node.accept();
-        else if (val.startsWith("/send "))
-          node.sendFile(val.split("/send ")[1].trim());
-        else node.sendMsg(val);
-      } else if (key.name === "backspace") {
-        currentInput = currentInput.slice(0, -1);
-        updateInput();
-      } else if (ch && !key.ctrl && !key.meta && ch.length === 1) {
-        currentInput += ch;
-        updateInput();
-      }
+      if (val.startsWith("/play")) node.invite();
+      else if (val.startsWith("/accept")) node.accept();
+      else if (val.startsWith("/send "))
+        node.sendFile(val.split("/send ")[1].trim());
+      else node.sendMsg(val);
+    } else if (key.name === "backspace") {
+      currentInput = currentInput.slice(0, -1);
+      renderInput();
+    } else if (key.name === "escape") {
+      isInputMode = false; // Exit typing mode
+      renderInput();
+    } else if (ch && !key.ctrl && !key.meta && ch.length === 1) {
+      currentInput += ch;
+      renderInput();
     }
   });
 
-  // Set initial focus
-  inputBox.focus();
+  // Initial render
+  renderInput();
 
   node.start();
   const ip =
@@ -634,8 +658,8 @@ class LanPeer extends EventEmitter {
       .flat()
       .find((i) => i.family === "IPv4" && !i.internal)?.address || "127.0.0.1";
   logBox.log(`{bold}Welcome ${identity.username}!{/}`);
-  logBox.log(`Mobile Link: {bold}http://${ip}:${node.port}{/}`);
-  logBox.log(`Default Channel: #General. Click "Active Chats" to DM.`);
+  logBox.log(`Mobile: {bold}http://${ip}:${node.port}{/}`);
+  logBox.log(`{yellow-fg}[!] TIP: Click "Discovered" to connect first.{/}`);
 
   screen.render();
 })();
