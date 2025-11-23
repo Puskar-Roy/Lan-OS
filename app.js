@@ -18,7 +18,8 @@ const CONFIG = {
   SERVICE_TYPE: "lanos_omega_v12",
   DIR_RECEIVE: path.resolve(process.cwd(), "received_files"),
   CONFIG_FILE: path.resolve(process.cwd(), "lan-identity.json"),
-  PING_INTERVAL: 3000,
+  // FIX: Increased interval to 10s to prevent auto-disconnects on laggy wifi
+  PING_INTERVAL: 10000,
   CHUNK_SIZE: 16 * 1024,
 };
 
@@ -26,20 +27,16 @@ if (!fs.existsSync(CONFIG.DIR_RECEIVE))
   fs.mkdirSync(CONFIG.DIR_RECEIVE, { recursive: true });
 
 // --- UTILS ---
-// FIX: Smarter IP detection to ignore Virtual Adapters (Docker, WSL, Hyper-V)
 const getIP = () => {
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
-    // Skip internal, docker, vethernet (Hyper-V), and wsl interfaces
     if (/(docker|vEthernet|wsl|br-|vmnet)/i.test(name)) continue;
-
     for (const i of interfaces[name]) {
       if (i.family === "IPv4" && !i.internal) {
         return i.address;
       }
     }
   }
-  // Fallback if no specific interface found
   return (
     Object.values(interfaces)
       .flat()
@@ -149,12 +146,22 @@ class NetworkNode extends EventEmitter {
     });
     this.wss = new WebSocketServer({ server });
 
-    // Heartbeat to keep connections alive
+    // FIX: Heartbeat Logic - Less Aggressive
     setInterval(() => {
-      this.conns.forEach((c) => {
-        if (c.isAlive === false) return c.ws.terminate();
+      this.conns.forEach((c, id) => {
+        if (c.isAlive === false) {
+          this.emit(
+            "log",
+            `${COLORS.err}Dropping dead connection: ${c.meta.name}${COLORS.reset}`
+          );
+          return c.ws.terminate();
+        }
         c.isAlive = false;
-        c.ws.ping();
+        try {
+          c.ws.ping();
+        } catch (e) {
+          // Socket might be closing already, ignore
+        }
       });
     }, CONFIG.PING_INTERVAL);
 
@@ -176,13 +183,10 @@ class NetworkNode extends EventEmitter {
 
     this.bonjour.find({ type: CONFIG.SERVICE_TYPE }).on("up", (s) => {
       if (s.txt?.id && s.txt.id !== this.identity.id) {
-        // FIX: Better address resolution. Prefer 'addresses' array, fall back to referer.
-        // We filter for IPv4-looking strings.
         const ip =
           s.addresses?.find((a) => a.includes(".")) ||
           s.referer?.address ||
           s.host;
-
         if (ip) {
           this.peers.set(s.txt.id, {
             id: s.txt.id,
@@ -204,23 +208,29 @@ class NetworkNode extends EventEmitter {
   }
 
   connect(id) {
-    if (this.conns.has(id)) return;
+    if (this.conns.has(id)) {
+      this.emit(
+        "log",
+        `${COLORS.sys}Already connected to this user.${COLORS.reset}`
+      );
+      return;
+    }
     const p = this.peers.get(id);
     if (!p) return;
 
-    // Log the actual IP being attempted
     this.emit(
       "log",
       `${COLORS.sys}Dialing ${p.address}:${p.port}...${COLORS.reset}`
     );
-
     const ws = new WebSocket(`ws://${p.address}:${p.port}`);
 
-    // FIX: Set a timeout to avoid endless "Connecting..."
     const timeout = setTimeout(() => {
       if (ws.readyState !== WebSocket.OPEN) {
         ws.terminate();
-        this.emit("log", `${COLORS.err}Connection timed out.${COLORS.reset}`);
+        this.emit(
+          "log",
+          `${COLORS.err}Connection timed out (5s).${COLORS.reset}`
+        );
       }
     }, 5000);
 
@@ -234,12 +244,17 @@ class NetworkNode extends EventEmitter {
 
     ws.on("open", () => {
       clearTimeout(timeout);
+      // FIX: Mark alive immediately so it doesn't get killed by heartbeat
+      ws.isAlive = true;
       this._send(ws, "pair", {
         fromId: this.identity.id,
         name: this.identity.username,
       });
       this._handleConn(ws);
-      this.emit("log", `${COLORS.me}Connected to ${p.name}!${COLORS.reset}`);
+      this.emit(
+        "log",
+        `${COLORS.me}Socket Open. Handshaking...${COLORS.reset}`
+      );
     });
   }
 
@@ -247,6 +262,7 @@ class NetworkNode extends EventEmitter {
     let peerId = null;
     ws.binaryType = "arraybuffer";
     ws.isAlive = true;
+
     ws.on("pong", () => {
       ws.isAlive = true;
     });
@@ -264,8 +280,22 @@ class NetworkNode extends EventEmitter {
         switch (type) {
           case "pair":
             peerId = payload.fromId;
-            this.conns.set(peerId, { ws, meta: payload, isAlive: true });
+            // FIX: If we are already connected, don't overwrite blindly
+            if (this.conns.has(peerId)) {
+              // Keep the fresher connection or just update metadata
+              const existing = this.conns.get(peerId);
+              existing.ws = ws;
+              existing.isAlive = true;
+            } else {
+              this.conns.set(peerId, { ws, meta: payload, isAlive: true });
+            }
+
             this.emit("conns_update");
+            this.emit(
+              "log",
+              `${COLORS.me}Connected to ${payload.name}${COLORS.reset}`
+            );
+
             if (!payload.ack)
               this._send(ws, "pair", {
                 fromId: this.identity.id,
@@ -348,25 +378,41 @@ class NetworkNode extends EventEmitter {
       } catch (e) {}
     });
 
-    ws.on("close", () => {
+    ws.on("close", (code, reason) => {
       if (peerId) {
-        this.conns.delete(peerId);
-        this.emit("conns_update");
+        // Only log if it was actually in our list
+        if (this.conns.has(peerId)) {
+          this.emit(
+            "log",
+            `${COLORS.err}${
+              this.conns.get(peerId).meta.name
+            } Disconnected (Code: ${code})${COLORS.reset}`
+          );
+          this.conns.delete(peerId);
+          this.emit("conns_update");
+        }
+
         if (this.activeTarget === peerId) {
           this.activeTarget = "general";
           this.emit("target_changed", "general");
-          this.emit(
-            "log",
-            `${COLORS.err}Target disconnected. Switched to General.${COLORS.reset}`
-          );
+          this.emit("log", `${COLORS.err}Switched to #General.${COLORS.reset}`);
         }
       }
+    });
+
+    ws.on("error", (e) => {
+      // Just log, close will handle cleanup
+      // this.emit("log", `${COLORS.err}Socket Error: ${e.message}${COLORS.reset}`);
     });
   }
 
   _send(ws, type, payload) {
-    if (ws.readyState === WebSocket.OPEN)
-      ws.send(JSON.stringify({ type, payload }));
+    try {
+      if (ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify({ type, payload }));
+    } catch (e) {
+      this.emit("log", `${COLORS.err}Send failed.${COLORS.reset}`);
+    }
   }
 
   processInput(text) {
@@ -381,14 +427,22 @@ class NetworkNode extends EventEmitter {
     if (text === "/allow") return this._approveShell();
 
     if (this.activeTarget === "general") {
-      this.conns.forEach((c) =>
+      let count = 0;
+      this.conns.forEach((c) => {
         this._send(c.ws, "msg", {
           fromId: this.identity.id,
           name: this.identity.username,
           text,
           isPm: false,
-        })
-      );
+        });
+        count++;
+      });
+      if (count === 0 && this.conns.size === 0) {
+        this.emit(
+          "log",
+          `${COLORS.err}No one is online to hear you.${COLORS.reset}`
+        );
+      }
       this.emit("chat", { name: "Me", text, isPm: false });
     } else {
       const t = this.conns.get(this.activeTarget);
@@ -767,6 +821,6 @@ class NetworkNode extends EventEmitter {
   connList.setItems(["#General"]);
   sysBox.log(`User: ${identity.username}`);
   sysBox.log(`IP: ${getIP()}`);
-  sysBox.log(`${COLORS.err}CHECK FIREWALL IF CONNECT FAILS${COLORS.reset}`);
+  sysBox.log(`Status: Ready.`);
   renderInput();
 })();
