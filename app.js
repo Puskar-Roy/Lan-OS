@@ -13,10 +13,10 @@ import contrib from "blessed-contrib";
 import inquirer from "inquirer";
 import { exec } from "child_process";
 
-
+// --- CONFIG ---
 const CONFIG = {
   PORT_RANGE: { min: 9000, max: 9999 },
-  SERVICE_TYPE: "lanos_omega_v11",
+  SERVICE_TYPE: "lanos_omega_v12",
   DIR_RECEIVE: path.resolve(process.cwd(), "received_files"),
   CONFIG_FILE: path.resolve(process.cwd(), "lan-identity.json"),
   PING_INTERVAL: 3000,
@@ -26,7 +26,7 @@ const CONFIG = {
 if (!fs.existsSync(CONFIG.DIR_RECEIVE))
   fs.mkdirSync(CONFIG.DIR_RECEIVE, { recursive: true });
 
-
+// --- UTILS ---
 const getIP = () =>
   Object.values(os.networkInterfaces())
     .flat()
@@ -43,7 +43,7 @@ const COLORS = {
   reset: "{/}",
 };
 
-
+// --- PROTOCOL ---
 class Protocol {
   static createBinary(fileId, chunk) {
     const header = JSON.stringify({ fileId });
@@ -67,7 +67,7 @@ class Protocol {
   }
 }
 
-
+// --- GAME LOGIC ---
 class GameEngine {
   constructor() {
     this.reset();
@@ -107,7 +107,7 @@ class GameEngine {
   }
 }
 
-
+// --- NETWORK CORE ---
 class NetworkNode extends EventEmitter {
   constructor(identity) {
     super();
@@ -119,9 +119,7 @@ class NetworkNode extends EventEmitter {
     this.game = new GameEngine();
     this.bonjour = Bonjour();
     this.activeTarget = "general";
-
-   
-    this.pendingShell = null; 
+    this.pendingShell = null;
   }
 
   start() {
@@ -131,7 +129,7 @@ class NetworkNode extends EventEmitter {
     });
     this.wss = new WebSocketServer({ server });
 
-    
+    // Heartbeat
     setInterval(() => {
       this.conns.forEach((c) => {
         if (c.isAlive === false) return c.ws.terminate();
@@ -174,9 +172,18 @@ class NetworkNode extends EventEmitter {
   }
 
   connect(id) {
+    if (this.conns.has(id)) return; // Prevent duplicate connections
     const p = this.peers.get(id);
     if (!p) return;
+
     const ws = new WebSocket(`ws://${p.address}:${p.port}`);
+    ws.on("error", (e) =>
+      this.emit(
+        "log",
+        `${COLORS.err}Connect Failed: ${e.message}${COLORS.reset}`
+      )
+    );
+
     ws.on("open", () => {
       this._send(ws, "pair", {
         fromId: this.identity.id,
@@ -218,17 +225,12 @@ class NetworkNode extends EventEmitter {
                 ack: true,
               });
             break;
-
           case "msg":
             this.emit("chat", payload);
             break;
-
-          
           case "nudge":
             this.emit("nudge_event", payload.fromName);
             break;
-
-          
           case "shell-req":
             this.pendingShell = { fromId: payload.fromId, cmd: payload.cmd };
             this.emit(
@@ -240,15 +242,12 @@ class NetworkNode extends EventEmitter {
               `Type ${COLORS.cmd}/allow${COLORS.reset} to execute or ignore to deny.`
             );
             break;
-
           case "shell-out":
             this.emit(
               "log",
               `${COLORS.cmd}[REMOTE OUTPUT]:${COLORS.reset}\n${payload.output}`
             );
             break;
-
-          
           case "file-offer":
             this.emit(
               "log",
@@ -263,7 +262,6 @@ class NetworkNode extends EventEmitter {
               path: fpath,
             });
             break;
-
           case "file-end":
             const t = this.transfers.get(payload.fileId);
             if (t) {
@@ -275,8 +273,6 @@ class NetworkNode extends EventEmitter {
               this.transfers.delete(payload.fileId);
             }
             break;
-
-          
           case "game-invite":
             this.emit(
               "log",
@@ -316,7 +312,6 @@ class NetworkNode extends EventEmitter {
       ws.send(JSON.stringify({ type, payload }));
   }
 
-
   processInput(text) {
     if (text === "/help") return this._showHelp();
     if (text.startsWith("/play")) return this._invite();
@@ -327,7 +322,6 @@ class NetworkNode extends EventEmitter {
     if (text.startsWith("/exec ")) return this._requestShell(text.slice(6));
     if (text === "/allow") return this._approveShell();
 
-   
     if (this.activeTarget === "general") {
       this.conns.forEach((c) =>
         this._send(c.ws, "msg", {
@@ -495,7 +489,7 @@ class NetworkNode extends EventEmitter {
   }
 }
 
-
+// --- UI ---
 (async () => {
   let identity;
   if (fs.existsSync(CONFIG.CONFIG_FILE))
@@ -513,12 +507,10 @@ class NetworkNode extends EventEmitter {
   }
 
   const node = new NetworkNode(identity);
-
   const screen = blessed.screen({ smartCSR: true, title: "LAN-OS OMEGA" });
-  screen.program.echo = false; 
+  screen.program.echo = false;
 
   const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
-
 
   const peerList = grid.set(0, 0, 6, 3, blessed.list, {
     label: " 1. Online ",
@@ -572,9 +564,9 @@ class NetworkNode extends EventEmitter {
     cells.push(b);
   }
 
-  // LOGIC
   let inputBuffer = "";
   let inInputMode = true;
+  let focusIndex = 0; // 0=Input, 1=PeerList, 2=ConnList
 
   const renderInput = () => {
     inputBox.setContent(" > " + inputBuffer + "_");
@@ -582,12 +574,8 @@ class NetworkNode extends EventEmitter {
     screen.render();
   };
 
- 
   const doShake = () => {
-   
     process.stdout.write("\x07");
-
-    
     let count = 0;
     const interval = setInterval(() => {
       const offset = count % 2 === 0 ? 1 : 0;
@@ -597,18 +585,20 @@ class NetworkNode extends EventEmitter {
       count++;
       if (count > 6) {
         clearInterval(interval);
-        logBox.top = 0; 
-        logBox.left = 3; 
+        logBox.top = 0;
+        logBox.left = 3;
         screen.render();
       }
     }, 50);
   };
 
   screen.on("keypress", (ch, key) => {
-    if (key.name === "escape" || key.name === "tab") {
-      inInputMode = !inInputMode;
-      if (!inInputMode) peerList.focus();
-      else inputBox.focus();
+    if (key.name === "tab") {
+      focusIndex = (focusIndex + 1) % 3;
+      inInputMode = focusIndex === 0;
+      if (focusIndex === 0) inputBox.focus();
+      else if (focusIndex === 1) peerList.focus();
+      else connList.focus();
       renderInput();
       return;
     }
@@ -631,14 +621,15 @@ class NetworkNode extends EventEmitter {
     }
   });
 
- 
   peerList.on("select", (item, i) => {
     const p = Array.from(node.peers.values())[i];
     if (p) {
       sysBox.log(`Connecting...`);
       node.connect(p.id);
     }
+    focusIndex = 0;
     inInputMode = true;
+    inputBox.focus();
     renderInput();
   });
 
@@ -648,15 +639,18 @@ class NetworkNode extends EventEmitter {
       node.activeTarget = "general";
       logBox.setLabel(" Chat: #General ");
     } else {
-      const t = Array.from(node.conns.values()).find((c) =>
-        name.includes(c.meta.name)
+      // FIX: Strict matching for reliability
+      const t = Array.from(node.conns.values()).find(
+        (c) => c.meta.name === name
       );
       if (t) {
         node.activeTarget = t.meta.fromId;
         logBox.setLabel(` Chat: @${t.meta.name} `);
       }
     }
+    focusIndex = 0;
     inInputMode = true;
+    inputBox.focus();
     renderInput();
   });
 
