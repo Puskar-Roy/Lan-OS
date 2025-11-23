@@ -12,160 +12,134 @@ import blessed from "blessed";
 import contrib from "blessed-contrib";
 import inquirer from "inquirer";
 
+// --- CONFIG ---
 const CONFIG = {
   PORT_RANGE: { min: 9000, max: 9999 },
-  SERVICE_TYPE: "lanos_v4",
+  SERVICE_TYPE: "lanos_v6_fix",
   DIR_RECEIVE: path.resolve(process.cwd(), "received"),
   CONFIG_FILE: path.resolve(process.cwd(), "lan-os-config.json"),
+  CHUNK_SIZE: 16 * 1024,
 };
 
 if (!fs.existsSync(CONFIG.DIR_RECEIVE))
   fs.mkdirSync(CONFIG.DIR_RECEIVE, { recursive: true });
 
+// --- PROTOCOL ---
+class Protocol {
+  static createBinary(fileId, chunk) {
+    const header = JSON.stringify({ fileId });
+    const hBuf = Buffer.from(header, "utf8");
+    const lenBuf = Buffer.alloc(4);
+    lenBuf.writeUInt32BE(hBuf.length, 0);
+    return Buffer.concat([lenBuf, hBuf, chunk]);
+  }
+  static parseBinary(buf) {
+    if (buf.length < 4) return null;
+    const hLen = buf.readUInt32BE(0);
+    if (buf.length < 4 + hLen) return null;
+    try {
+      return {
+        header: JSON.parse(buf.subarray(4, 4 + hLen).toString("utf8")),
+        data: buf.subarray(4 + hLen),
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
+// --- IDENTITY ---
 async function loadOrSetupIdentity() {
   if (fs.existsSync(CONFIG.CONFIG_FILE)) {
     return JSON.parse(fs.readFileSync(CONFIG.CONFIG_FILE, "utf-8"));
   }
-
   console.clear();
-  console.log("--- LAN-OS Setup ---");
   const answers = await inquirer.prompt([
     {
       type: "input",
       name: "username",
-      message: "Enter your Display Name:",
-      validate: (input) => (input.length > 0 ? true : "Name cannot be empty."),
+      message: "Enter Display Name:",
+      validate: (i) => (i.length > 0 ? true : "Required."),
     },
   ]);
-
   const identity = {
     id: uuidv4(),
     username: answers.username,
     device: os.hostname(),
-    created: Date.now(),
   };
-
   fs.writeFileSync(CONFIG.CONFIG_FILE, JSON.stringify(identity, null, 2));
-  console.log("Identity saved! Starting OS...");
-  await new Promise((r) => setTimeout(r, 1000));
   return identity;
 }
 
+// --- WEB CLIENT (MOBILE) ---
 const WEB_CLIENT_HTML = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LAN-OS Mobile</title>
     <style>
-        body { background: #1a1a1a; color: #0f0; font-family: monospace; padding: 0; margin: 0; height: 100vh; display: flex; flex-direction: column; }
-        #login-screen { position: absolute; top:0; left:0; width:100%; height:100%; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 99; }
-        .login-box { border: 1px solid #0f0; padding: 20px; text-align: center; }
-        #app { display: none; flex-direction: column; height: 100%; padding: 10px; box-sizing: border-box; }
-        #log { flex: 1; border: 1px solid #333; overflow-y: scroll; padding: 10px; margin-bottom: 10px; background: #000; }
-        .msg { margin: 5px 0; word-wrap: break-word; }
-        #controls { display: flex; gap: 5px; height: 50px; }
-        input { flex: 1; background: #222; border: 1px solid #444; color: white; padding: 10px; font-size: 16px; }
-        button { background: #004400; color: white; border: none; padding: 10px 20px; font-size: 16px; cursor: pointer; }
-        #game-board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; max-width: 300px; margin: 10px auto; display: none; }
-        .cell { background: #333; height: 60px; display: flex; align-items: center; justify-content: center; font-size: 24px; border: 1px solid #555; }
+        body { background: #111; color: #0f0; font-family: monospace; display: flex; flex-direction: column; height: 100vh; margin:0; }
+        #login { position: fixed; top:0; left:0; width:100%; height:100%; background:#000; display:flex; flex-direction:column; align-items:center; justify-content:center; z-index:9; }
+        #app { display:none; flex-direction:column; height:100%; padding:10px; }
+        #header { border-bottom: 1px solid #333; padding-bottom: 5px; margin-bottom: 5px; color: yellow; }
+        #log { flex:1; overflow-y:scroll; border:1px solid #333; padding:5px; margin-bottom:5px; background: #000; }
+        .msg { margin: 2px 0; word-break: break-all; }
+        input, button { padding:10px; background:#222; color:#fff; border:1px solid #444; }
+        #ctrl { display:flex; gap:5px; } input { flex:1; }
     </style>
 </head>
 <body>
-    <div id="login-screen">
-        <div class="login-box">
-            <h2>LAN-OS LOGIN</h2>
-            <input type="text" id="username" placeholder="Enter Name" />
-            <br><br>
-            <button onclick="startApp()">JOIN NETWORK</button>
-        </div>
-    </div>
-    <div id="app">
-        <div id="header" style="border-bottom: 1px solid #333; margin-bottom: 10px;"></div>
-        <div id="game-board"></div>
-        <div id="log"></div>
-        <div id="controls">
-            <input type="text" id="input" placeholder="Message..." />
-            <button onclick="send()">Send</button>
-        </div>
-    </div>
+    <div id="login"><h2>LAN-OS v6</h2><input id="u" placeholder="Name"><br><button onclick="join()">JOIN GENERAL</button></div>
+    <div id="app"><div id="header">Channel: #General</div><div id="log"></div><div id="ctrl"><input id="i"><button onclick="send()">Send</button></div></div>
     <script>
-        let ws;
-        let myId = Math.random().toString(36).substring(7);
-        let myName = "";
-        function startApp() {
-            const nameInput = document.getElementById('username').value;
-            if(!nameInput) return alert("Name required");
-            myName = nameInput;
-            document.getElementById('login-screen').style.display = 'none';
-            document.getElementById('app').style.display = 'flex';
-            document.getElementById('header').innerText = \`Logged in as: \${myName}\`;
-            initWs();
-        }
-        const boardDiv = document.getElementById('game-board');
-        for(let i=0; i<9; i++) {
-            let c = document.createElement('div');
-            c.className = 'cell';
-            c.id = 'c'+i;
-            c.onclick = () => { if(ws) ws.send(JSON.stringify({ type: 'game-move', payload: { index: i, symbol: 'O' } })); };
-            boardDiv.appendChild(c);
-        }
-        function log(text, color='white') {
-            const d = document.getElementById('log');
-            d.innerHTML += \`<div class="msg" style="color:\${color}">\${text}</div>\`;
-            d.scrollTop = d.scrollHeight;
-        }
-        function initWs() {
-            ws = new WebSocket('ws://' + window.location.host);
-            ws.onopen = () => {
-                log('Connected to Host', '#0f0');
-                ws.send(JSON.stringify({ type: 'pair', payload: { fromId: myId, name: myName, device: 'Mobile Browser', isWeb: true } }));
-            };
-            ws.onmessage = (event) => {
-                if (event.data instanceof Blob) return;
+        let ws, id = Math.random().toString(36).substr(2), name;
+        function join() {
+            name = document.getElementById('u').value;
+            if(!name) return;
+            document.getElementById('login').style.display='none';
+            document.getElementById('app').style.display='flex';
+            ws = new WebSocket('ws://'+location.host);
+            ws.binaryType = 'arraybuffer';
+            ws.onopen = () => ws.send(JSON.stringify({type:'pair', payload:{fromId:id, name, device:'Mobile', isWeb:true}}));
+            ws.onmessage = (e) => {
+                if(e.data instanceof ArrayBuffer) return;
                 try {
-                    const { type, payload } = JSON.parse(event.data);
-                    if (type === 'msg') log(\`[\${payload.name || payload.fromId.slice(0,4)}]: \${payload.text}\`);
-                    if (type === 'game-invite') log('Game Invite! Type /accept to play', 'magenta');
-                    if (type === 'game-start') { document.getElementById('game-board').style.display = 'grid'; log('Game Started!', 'magenta'); }
-                    if (type === 'game-move') document.getElementById('c'+payload.index).innerText = payload.symbol;
-                } catch(e) {}
+                    const {type, payload} = JSON.parse(e.data);
+                    if(type==='msg') log(\`[\${payload.name}]: \${payload.text}\`, payload.isPm ? '#f0f' : '#fff');
+                    if(type==='game-invite') log('Game Invite received! (Games restricted to Desktop)', 'red');
+                } catch(x){}
             };
         }
+        function log(t,c='#fff') { const d=document.getElementById('log'); d.innerHTML+=\`<div class="msg" style="color:\${c}">\${t}</div>\`; d.scrollTop=d.scrollHeight; }
         function send() {
-            const i = document.getElementById('input');
-            const txt = i.value;
-            if(!txt) return;
-            if(txt === '/accept') ws.send(JSON.stringify({ type: 'msg', payload: { fromId: myId, text: '/accept' } })); 
-            else ws.send(JSON.stringify({ type: 'msg', payload: { fromId: myId, text: txt } }));
-            log('Me: ' + txt, 'cyan');
-            i.value = '';
+            const i=document.getElementById('i'); if(!i.value)return;
+            ws.send(JSON.stringify({type:'msg', payload:{fromId:id, text:i.value}}));
+            log('Me: '+i.value, '#0ff'); i.value='';
         }
     </script>
 </body>
 </html>
 `;
 
+// --- GAME LOGIC ---
 class TicTacToe {
   constructor() {
-    this.board = Array(9).fill(null);
-    this.turn = "X";
-    this.active = false;
+    this.reset();
   }
   reset() {
-    this.board.fill(null);
+    this.board = Array(9).fill(null);
     this.turn = "X";
     this.active = true;
   }
-  move(idx, sym) {
-    if (!this.active || this.board[idx]) return false;
-    this.board[idx] = sym;
-    this.turn = this.turn === "X" ? "O" : "X";
+  move(i, s) {
+    if (!this.active || this.board[i]) return false;
+    this.board[i] = s;
+    this.turn = s === "X" ? "O" : "X";
     return true;
   }
   checkWin() {
-    const wins = [
+    const w = [
       [0, 1, 2],
       [3, 4, 5],
       [6, 7, 8],
@@ -175,37 +149,38 @@ class TicTacToe {
       [0, 4, 8],
       [2, 4, 6],
     ];
-    for (let c of wins)
+    for (let c of w)
       if (
         this.board[c[0]] &&
         this.board[c[0]] === this.board[c[1]] &&
         this.board[c[0]] === this.board[c[2]]
       )
         return this.board[c[0]];
-    if (!this.board.includes(null)) return "DRAW";
-    return null;
+    return !this.board.includes(null) ? "DRAW" : null;
   }
 }
 
+// --- NODE (The Engine) ---
 class LanPeer extends EventEmitter {
   constructor(identity) {
     super();
     this.identity = identity;
     this.port = CONFIG.PORT_RANGE.min + Math.floor(Math.random() * 1000);
     this.peers = new Map();
-    this.connections = new Map();
+    this.conns = new Map();
+    this.transfers = new Map();
     this.game = new TicTacToe();
     this.bonjour = Bonjour();
+    this.activeChannel = "general";
   }
 
   start() {
-    const server = http.createServer((req, res) => {
-      res.writeHead(200, { "Content-Type": "text/html" });
-      res.end(WEB_CLIENT_HTML);
+    const server = http.createServer((q, r) => {
+      r.writeHead(200, { "Content-Type": "text/html" });
+      r.end(WEB_CLIENT_HTML);
     });
     this.wss = new WebSocketServer({ server });
     this.wss.on("connection", (ws) => this._handleConn(ws));
-
     server.listen(this.port, "0.0.0.0", () => {
       this.bonjour.publish({
         name: this.identity.username,
@@ -214,21 +189,22 @@ class LanPeer extends EventEmitter {
         txt: { id: this.identity.id, device: this.identity.device },
       });
       this.bonjour.find({ type: CONFIG.SERVICE_TYPE }).on("up", (s) => {
-        if (!s.txt?.id || s.txt.id === this.identity.id) return;
-        this.peers.set(s.txt.id, {
-          id: s.txt.id,
-          name: s.name,
-          device: s.txt.device || "Unknown Device",
-          address: s.referer?.address || s.host,
-          port: s.port,
-        });
-        this.emit("peers", Array.from(this.peers.values()));
+        if (s.txt?.id && s.txt.id !== this.identity.id) {
+          this.peers.set(s.txt.id, {
+            id: s.txt.id,
+            name: s.name,
+            device: s.txt.device,
+            address: s.referer?.address || s.host,
+            port: s.port,
+          });
+          this.emit("peers", Array.from(this.peers.values()));
+        }
       });
     });
   }
 
-  connect(peerId) {
-    const p = this.peers.get(peerId);
+  connect(id) {
+    const p = this.peers.get(id);
     if (!p) return;
     const ws = new WebSocket(`ws://${p.address}:${p.port}`);
     ws.on("open", () => {
@@ -247,106 +223,235 @@ class LanPeer extends EventEmitter {
   }
 
   _handleConn(ws) {
-    let rId = null;
-    ws.on("message", (d) => {
-      try {
-        const msg = JSON.parse(d.toString());
-        const { type, payload } = msg;
-        if (type === "pair") {
-          rId = payload.fromId;
-          this.connections.set(rId, { ws, meta: payload });
-          this.emit(
-            "log",
-            `{green-fg}Connected: ${payload.name} (${payload.device}){/}`
-          );
-          if (!payload.isWeb && !payload.ack) {
-            ws.send(
-              JSON.stringify({
-                type: "pair",
-                payload: {
-                  fromId: this.identity.id,
-                  name: this.identity.username,
-                  device: this.identity.device,
-                  ack: true,
-                },
-              })
+    ws.binaryType = "arraybuffer";
+    let rid = null;
+    ws.on("message", (data, isBin) => {
+      if (isBin) {
+        const parsed = Protocol.parseBinary(Buffer.from(data));
+        if (parsed) this._handleChunk(parsed);
+      } else {
+        try {
+          const { type, payload } = JSON.parse(data.toString());
+          if (type === "pair") {
+            rid = payload.fromId;
+            this.conns.set(rid, { ws, meta: payload });
+            this.emit("log", `{green-fg}User Joined: ${payload.name}{/}`);
+            if (!payload.isWeb && !payload.ack)
+              ws.send(
+                JSON.stringify({
+                  type: "pair",
+                  payload: {
+                    fromId: this.identity.id,
+                    name: this.identity.username,
+                    device: this.identity.device,
+                    ack: true,
+                  },
+                })
+              );
+            this.emit("conn", Array.from(this.conns.values()));
+          } else if (type === "msg") {
+            const sender =
+              this.conns.get(payload.fromId)?.meta.name || "Unknown";
+            if (payload.isPm) {
+              this.emit(
+                "log",
+                `{magenta-fg}[DM ${sender}]: ${payload.text}{/}`
+              );
+            } else {
+              this.emit(
+                "log",
+                `{cyan-fg}[#General ${sender}]:{/} ${payload.text}`
+              );
+            }
+          } else if (type === "file-offer") {
+            this.emit(
+              "log",
+              `{yellow-fg}Receiving file from ${payload.fromName}: ${payload.filename}{/}`
             );
+            const fpath = path.join(
+              CONFIG.DIR_RECEIVE,
+              `${Date.now()}_${payload.filename}`
+            );
+            this.transfers.set(payload.fileId, {
+              stream: fs.createWriteStream(fpath),
+              path: fpath,
+            });
+          } else if (type === "file-end") {
+            const t = this.transfers.get(payload.fileId);
+            if (t) {
+              t.stream.end();
+              this.emit("log", `{green-fg}File Saved: ${t.path}{/}`);
+            }
+          } else if (type === "game-invite")
+            this.emit(
+              "log",
+              `{magenta-fg}Game Invite from ${payload.fromName}! Type /accept{/}`
+            );
+          else if (type === "game-start") {
+            this.game.reset();
+            this.emit("game-update");
+            this.emit("log", `{magenta-fg}Game Started!{/}`);
+          } else if (type === "game-move") {
+            this.game.move(payload.index, payload.symbol);
+            this.emit("game-update");
+            this._checkGame();
           }
-          this.emit("conn", Array.from(this.connections.values()));
-        } else if (type === "msg") {
-          const peer = this.connections.get(payload.fromId);
-          this.emit(
-            "log",
-            `{cyan-fg}[${peer ? peer.meta.name : "Unknown"}]:{/} ${
-              payload.text
-            }`
-          );
-        } else if (type === "game-move") {
-          this.game.move(payload.index, payload.symbol);
-          this.emit("game-update");
-          this._checkGame();
-        }
-      } catch (e) {}
+        } catch (e) {}
+      }
     });
     ws.on("close", () => {
-      if (rId) {
-        const p = this.connections.get(rId);
-        this.emit(
-          "log",
-          `{yellow-fg}Disconnected: ${p ? p.meta.name : rId}{/}`
-        );
-        this.connections.delete(rId);
+      if (rid) {
+        this.conns.delete(rid);
+        this.emit("conn", Array.from(this.conns.values()));
       }
-      this.emit("conn", Array.from(this.connections.values()));
     });
   }
 
-  chat(text) {
-    this.connections.forEach((c) =>
-      c.ws.send(
+  _handleChunk({ header, data }) {
+    const t = this.transfers.get(header.fileId);
+    if (t) t.stream.write(data);
+  }
+
+  sendMsg(text) {
+    if (this.activeChannel === "general") {
+      this.conns.forEach((c) =>
+        c.ws.send(
+          JSON.stringify({
+            type: "msg",
+            payload: {
+              fromId: this.identity.id,
+              name: this.identity.username,
+              text,
+              isPm: false,
+            },
+          })
+        )
+      );
+      this.emit("log", `{blue-fg}[#General Me]: ${text}{/}`);
+    } else {
+      const target = this.conns.get(this.activeChannel);
+      if (target) {
+        target.ws.send(
+          JSON.stringify({
+            type: "msg",
+            payload: {
+              fromId: this.identity.id,
+              name: this.identity.username,
+              text,
+              isPm: true,
+            },
+          })
+        );
+        this.emit("log", `{magenta-fg}[DM -> ${target.meta.name}]: ${text}{/}`);
+      } else {
+        this.emit("log", `{red-fg}User not connected. Switched to General.{/}`);
+        this.activeChannel = "general";
+      }
+    }
+  }
+
+  sendFile(fpath) {
+    if (!fs.existsSync(fpath))
+      return this.emit("log", `{red-fg}File not found{/}`);
+    const targets =
+      this.activeChannel === "general"
+        ? Array.from(this.conns.values())
+        : [this.conns.get(this.activeChannel)].filter(Boolean);
+    if (targets.length === 0)
+      return this.emit("log", `{red-fg}No one to receive file.{/}`);
+    const fname = path.basename(fpath);
+    const fsize = fs.statSync(fpath).size;
+    const fid = uuidv4();
+    targets.forEach((t) =>
+      t.ws.send(
         JSON.stringify({
-          type: "msg",
-          payload: { fromId: this.identity.id, text },
+          type: "file-offer",
+          payload: {
+            fromId: this.identity.id,
+            fromName: this.identity.username,
+            fileId: fid,
+            filename: fname,
+            size: fsize,
+          },
         })
       )
     );
-    this.emit("log", `{blue-fg}Me: ${text}{/}`);
+    const stream = fs.createReadStream(fpath, {
+      highWaterMark: CONFIG.CHUNK_SIZE,
+    });
+    stream.on("data", (chunk) => {
+      const bin = Protocol.createBinary(fid, chunk);
+      targets.forEach((t) => t.ws.send(bin));
+    });
+    stream.on("end", () => {
+      targets.forEach((t) =>
+        t.ws.send(
+          JSON.stringify({ type: "file-end", payload: { fileId: fid } })
+        )
+      );
+      this.emit(
+        "log",
+        `{green-fg}Sent: ${fname} to ${
+          this.activeChannel === "general" ? "everyone" : "peer"
+        }{/}`
+      );
+    });
   }
 
-  invite(peerId) {
-    const c = this.connections.get(peerId);
-    if (c)
-      c.ws.send(
+  invite() {
+    this.game.reset();
+    const targets =
+      this.activeChannel === "general"
+        ? Array.from(this.conns.values())
+        : [this.conns.get(this.activeChannel)].filter(Boolean);
+    targets.forEach((t) =>
+      t.ws.send(
         JSON.stringify({
           type: "game-invite",
-          payload: { fromId: this.identity.id },
+          payload: {
+            fromId: this.identity.id,
+            fromName: this.identity.username,
+          },
         })
-      );
-    this.game.reset();
-    this.emit("log", `Invited ${c ? c.meta.name : "peer"}. Waiting...`);
+      )
+    );
+    this.emit(
+      "log",
+      `Invited ${
+        this.activeChannel === "general" ? "everyone" : "peer"
+      } to Game.`
+    );
   }
 
-  accept(peerId) {
-    const c = this.connections.get(peerId);
+  accept() {
     this.game.reset();
-    if (c)
-      c.ws.send(
+    const targets =
+      this.activeChannel === "general"
+        ? Array.from(this.conns.values())
+        : [this.conns.get(this.activeChannel)].filter(Boolean);
+    targets.forEach((t) =>
+      t.ws.send(
         JSON.stringify({
           type: "game-start",
           payload: { opponentId: this.identity.id },
         })
-      );
+      )
+    );
     this.emit("game-update");
     this.emit("log", `{magenta-fg}Game Started!{/}`);
   }
 
-  makeMove(idx) {
-    if (this.game.move(idx, "X")) {
-      this.connections.forEach((c) =>
-        c.ws.send(
+  makeMove(i) {
+    if (this.game.move(i, "X")) {
+      const targets =
+        this.activeChannel === "general"
+          ? Array.from(this.conns.values())
+          : [this.conns.get(this.activeChannel)].filter(Boolean);
+      targets.forEach((t) =>
+        t.ws.send(
           JSON.stringify({
             type: "game-move",
-            payload: { index: idx, symbol: "X" },
+            payload: { index: i, symbol: "X" },
           })
         )
       );
@@ -364,29 +469,38 @@ class LanPeer extends EventEmitter {
   }
 }
 
+// --- BOOTSTRAP ---
 (async () => {
   const identity = await loadOrSetupIdentity();
   const node = new LanPeer(identity);
 
   const screen = blessed.screen({
     smartCSR: false,
-    title: `LAN-OS: ${identity.username}`,
+    title: `LAN-OS v6`,
     fullUnicode: true,
   });
+  const grid = new contrib.grid({ rows: 12, cols: 12, screen });
 
-  const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
+  // Layout
   const pList = grid.set(0, 0, 8, 3, blessed.list, {
-    label: " Discovered ",
-    style: { selected: { bg: "blue" } },
+    label: " 1. Discovered ",
     keys: true,
     mouse: true,
+    style: { selected: { bg: "blue" } },
+    border: "line",
+  });
+  const cList = grid.set(8, 0, 4, 3, blessed.list, {
+    label: " 2. Chats ",
+    keys: true,
+    mouse: true,
+    style: { selected: { bg: "magenta" } },
     border: "line",
   });
   const logBox = grid.set(0, 3, 8, 6, blessed.log, {
-    label: ` Log (${identity.username}) `,
+    label: ` Chat: #General `,
     tags: true,
-    scrollbar: { bg: "blue" },
     mouse: true,
+    scrollbar: { bg: "blue" },
     border: "line",
   });
   const gameBox = grid.set(0, 9, 8, 3, blessed.box, {
@@ -394,14 +508,14 @@ class LanPeer extends EventEmitter {
     border: "line",
   });
 
-  const input = grid.set(8, 0, 4, 12, blessed.textbox, {
-    label: " Input ",
-    keys: true,
-    mouse: true,
-    inputOnFocus: true,
+  // FIX: Using a dumb BOX instead of Textbox to prevent double typing
+  const inputBox = grid.set(8, 3, 4, 9, blessed.box, {
+    label: " Message (Type here) ",
     border: "line",
     style: { bg: "black", fg: "white" },
   });
+
+  cList.setItems(["#General"]);
 
   const cells = [];
   for (let i = 0; i < 9; i++) {
@@ -424,11 +538,12 @@ class LanPeer extends EventEmitter {
     screen.render();
   });
   node.on("peers", (l) => {
-    pList.setItems(l.map((p) => `${p.name} | ${p.device}`));
+    pList.setItems(l.map((p) => `${p.name}`));
     screen.render();
   });
   node.on("conn", (l) => {
-    logBox.setLabel(` Log (Connected: ${l.length}) `);
+    const names = ["#General", ...l.map((c) => c.meta.name)];
+    cList.setItems(names);
     screen.render();
   });
   node.on("game-update", () => {
@@ -447,33 +562,80 @@ class LanPeer extends EventEmitter {
     }
   });
 
-  input.on("submit", (val) => {
-    input.clearValue();
-    input.focus();
-    if (!val) return;
-    if (val.startsWith("/play"))
-      node.invite(Array.from(node.connections.keys())[0]);
-    else if (val.startsWith("/accept"))
-      node.accept(Array.from(node.connections.keys())[0]);
-    else node.chat(val);
+  cList.on("select", (item, i) => {
+    const name = item.content;
+    if (name === "#General") {
+      node.activeChannel = "general";
+      logBox.setLabel(" Chat: #General ");
+    } else {
+      const target = Array.from(node.conns.values()).find(
+        (c) => c.meta.name === name
+      );
+      if (target) {
+        node.activeChannel = target.meta.fromId;
+        logBox.setLabel(` Chat: DM @${name} `);
+      }
+    }
     screen.render();
   });
 
-  node.start();
+  // --- MANUAL INPUT HANDLER (THE FIX) ---
+  let currentInput = "";
 
-  const nets = os.networkInterfaces();
-  let myIp = "127.0.0.1";
-  for (const name of Object.keys(nets)) {
-    for (const net of nets[name]) {
-      if (net.family === "IPv4" && !net.internal) myIp = net.address;
+  const updateInput = () => {
+    inputBox.setContent(currentInput + "_"); // Add cursor
+    screen.render();
+  };
+
+  screen.on("keypress", (ch, key) => {
+    // Handle Global Exit
+    if (key.name === "c" && key.ctrl) process.exit(0);
+
+    // Handle Tab Switching
+    if (key.name === "tab") {
+      screen.focusNext();
+      screen.render();
+      return;
     }
-  }
 
-  logBox.log(`{bold}Welcome, ${identity.username}!{/}`);
-  logBox.log(`Device: ${identity.device}`);
-  logBox.log(`Mobile URL: {bold}http://${myIp}:${node.port}{/}`);
+    // Handle Input Logic (Only if inputBox is focused)
+    // Note: We assume input is focused if lists aren't
+    if (
+      inputBox === screen.focused ||
+      (screen.focused !== pList && screen.focused !== cList)
+    ) {
+      if (key.name === "return" || key.name === "enter") {
+        if (!currentInput) return;
+        const val = currentInput;
+        currentInput = "";
+        updateInput();
 
-  input.focus();
-  screen.key(["C-c"], () => process.exit(0));
+        if (val.startsWith("/play")) node.invite();
+        else if (val.startsWith("/accept")) node.accept();
+        else if (val.startsWith("/send "))
+          node.sendFile(val.split("/send ")[1].trim());
+        else node.sendMsg(val);
+      } else if (key.name === "backspace") {
+        currentInput = currentInput.slice(0, -1);
+        updateInput();
+      } else if (ch && !key.ctrl && !key.meta && ch.length === 1) {
+        currentInput += ch;
+        updateInput();
+      }
+    }
+  });
+
+  // Set initial focus
+  inputBox.focus();
+
+  node.start();
+  const ip =
+    Object.values(os.networkInterfaces())
+      .flat()
+      .find((i) => i.family === "IPv4" && !i.internal)?.address || "127.0.0.1";
+  logBox.log(`{bold}Welcome ${identity.username}!{/}`);
+  logBox.log(`Mobile Link: {bold}http://${ip}:${node.port}{/}`);
+  logBox.log(`Default Channel: #General. Click "Active Chats" to DM.`);
+
   screen.render();
 })();
