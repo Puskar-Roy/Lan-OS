@@ -26,10 +26,26 @@ if (!fs.existsSync(CONFIG.DIR_RECEIVE))
   fs.mkdirSync(CONFIG.DIR_RECEIVE, { recursive: true });
 
 // --- UTILS ---
-const getIP = () =>
-  Object.values(os.networkInterfaces())
-    .flat()
-    .find((i) => i.family === "IPv4" && !i.internal)?.address || "127.0.0.1";
+// FIX: Smarter IP detection to ignore Virtual Adapters (Docker, WSL, Hyper-V)
+const getIP = () => {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    // Skip internal, docker, vethernet (Hyper-V), and wsl interfaces
+    if (/(docker|vEthernet|wsl|br-|vmnet)/i.test(name)) continue;
+
+    for (const i of interfaces[name]) {
+      if (i.family === "IPv4" && !i.internal) {
+        return i.address;
+      }
+    }
+  }
+  // Fallback if no specific interface found
+  return (
+    Object.values(interfaces)
+      .flat()
+      .find((i) => i.family === "IPv4" && !i.internal)?.address || "127.0.0.1"
+  );
+};
 
 const COLORS = {
   sys: "{yellow-fg}",
@@ -77,7 +93,6 @@ class GameEngine {
     this.turn = "X";
     this.myRole = null;
   }
-  // FIX: Added missing start method
   start(myRole) {
     this.reset();
     this.active = true;
@@ -134,7 +149,7 @@ class NetworkNode extends EventEmitter {
     });
     this.wss = new WebSocketServer({ server });
 
-    // Heartbeat
+    // Heartbeat to keep connections alive
     setInterval(() => {
       this.conns.forEach((c) => {
         if (c.isAlive === false) return c.ws.terminate();
@@ -158,17 +173,28 @@ class NetworkNode extends EventEmitter {
       port: this.port,
       txt: { id: this.identity.id },
     });
+
     this.bonjour.find({ type: CONFIG.SERVICE_TYPE }).on("up", (s) => {
       if (s.txt?.id && s.txt.id !== this.identity.id) {
-        this.peers.set(s.txt.id, {
-          id: s.txt.id,
-          name: s.name,
-          address: s.referer?.address || s.host,
-          port: s.port,
-        });
-        this.emit("peers_update");
+        // FIX: Better address resolution. Prefer 'addresses' array, fall back to referer.
+        // We filter for IPv4-looking strings.
+        const ip =
+          s.addresses?.find((a) => a.includes(".")) ||
+          s.referer?.address ||
+          s.host;
+
+        if (ip) {
+          this.peers.set(s.txt.id, {
+            id: s.txt.id,
+            name: s.name,
+            address: ip,
+            port: s.port,
+          });
+          this.emit("peers_update");
+        }
       }
     });
+
     this.bonjour.find({ type: CONFIG.SERVICE_TYPE }).on("down", (s) => {
       if (s.txt?.id) {
         this.peers.delete(s.txt.id);
@@ -181,19 +207,39 @@ class NetworkNode extends EventEmitter {
     if (this.conns.has(id)) return;
     const p = this.peers.get(id);
     if (!p) return;
+
+    // Log the actual IP being attempted
+    this.emit(
+      "log",
+      `${COLORS.sys}Dialing ${p.address}:${p.port}...${COLORS.reset}`
+    );
+
     const ws = new WebSocket(`ws://${p.address}:${p.port}`);
-    ws.on("error", (e) =>
+
+    // FIX: Set a timeout to avoid endless "Connecting..."
+    const timeout = setTimeout(() => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        ws.terminate();
+        this.emit("log", `${COLORS.err}Connection timed out.${COLORS.reset}`);
+      }
+    }, 5000);
+
+    ws.on("error", (e) => {
+      clearTimeout(timeout);
       this.emit(
         "log",
-        `${COLORS.err}Connect Failed: ${e.message}${COLORS.reset}`
-      )
-    );
+        `${COLORS.err}Connect Error: ${e.message}${COLORS.reset}`
+      );
+    });
+
     ws.on("open", () => {
+      clearTimeout(timeout);
       this._send(ws, "pair", {
         fromId: this.identity.id,
         name: this.identity.username,
       });
       this._handleConn(ws);
+      this.emit("log", `${COLORS.me}Connected to ${p.name}!${COLORS.reset}`);
     });
   }
 
@@ -218,7 +264,6 @@ class NetworkNode extends EventEmitter {
         switch (type) {
           case "pair":
             peerId = payload.fromId;
-            // Update existing if reconnecting
             this.conns.set(peerId, { ws, meta: payload, isAlive: true });
             this.emit("conns_update");
             if (!payload.ack)
@@ -281,8 +326,8 @@ class NetworkNode extends EventEmitter {
               "log",
               `${COLORS.dm}INVITE: ${payload.name} wants to play! Type /accept${COLORS.reset}`
             );
-            this.activeTarget = payload.fromId; // Switch context to sender
-            this.emit("target_changed", this.activeTarget); // Notify UI
+            this.activeTarget = payload.fromId;
+            this.emit("target_changed", this.activeTarget);
             break;
           case "game-start":
             this.game.start(payload.role || "X");
@@ -590,7 +635,6 @@ class NetworkNode extends EventEmitter {
 
   const renderInput = () => {
     inputBox.setContent(" > " + inputBuffer + "_");
-    // Visual cue for input mode: Green border for #General, Cyan for DM
     const isGeneral = node.activeTarget === "general";
     inputBox.style.border.fg = inInputMode
       ? isGeneral
@@ -618,7 +662,6 @@ class NetworkNode extends EventEmitter {
     }, 50);
   };
 
-  // KEY HANDLER
   screen.on("keypress", (ch, key) => {
     if (key.name === "tab") {
       focusIndex = (focusIndex + 1) % 3;
@@ -648,28 +691,23 @@ class NetworkNode extends EventEmitter {
     }
   });
 
-  // PEER SELECTION
   peerList.on("select", (item, i) => {
     const p = Array.from(node.peers.values())[i];
     if (p) {
       sysBox.log(`Connecting to ${p.name}...`);
       node.connect(p.id);
     }
-    // Reset focus to input after clicking
     focusIndex = 0;
     inInputMode = true;
     inputBox.focus();
     renderInput();
   });
 
-  // CHAT SELECTION FIX
   connList.on("select", (item, i) => {
-    // i=0 is #General
     if (i === 0) {
       node.activeTarget = "general";
       logBox.setLabel(" Chat: #General ");
     } else {
-      // FIX: Use index to find connection instead of unstable string matching
       const connections = Array.from(node.conns.values());
       const t = connections[i - 1];
       if (t) {
@@ -683,7 +721,6 @@ class NetworkNode extends EventEmitter {
     renderInput();
   });
 
-  // UI UPDATES
   node.on("log", (m) => {
     sysBox.log(m);
     screen.render();
@@ -709,7 +746,6 @@ class NetworkNode extends EventEmitter {
     ]);
     screen.render();
   });
-  // Handle automatic target changes (e.g. receiving invite)
   node.on("target_changed", (targetId) => {
     if (targetId === "general") {
       logBox.setLabel(" Chat: #General ");
@@ -731,6 +767,6 @@ class NetworkNode extends EventEmitter {
   connList.setItems(["#General"]);
   sysBox.log(`User: ${identity.username}`);
   sysBox.log(`IP: ${getIP()}`);
-  sysBox.log(`Type /help for commands`);
+  sysBox.log(`${COLORS.err}CHECK FIREWALL IF CONNECT FAILS${COLORS.reset}`);
   renderInput();
 })();
