@@ -1,0 +1,554 @@
+#!/usr/bin/env node
+
+/**
+ * LAN-OS GUI Edition (No Electron)
+ * Uses standard browser as the GUI engine (Lightweight & Cross-platform).
+ */
+
+import fs from "fs";
+import path from "path";
+import os from "os";
+import http from "http";
+import express from "express";
+import { Server } from "socket.io";
+import { io as Client } from "socket.io-client";
+import Bonjour from "bonjour";
+import { v4 as uuidv4 } from "uuid";
+import open from "open";
+import inquirer from "inquirer";
+
+// --- CONFIG ---
+const CONFIG = {
+  PORT_RANGE: { min: 9000, max: 9900 },
+  SERVICE_TYPE: "lanos_gui_v1",
+  DIR_RECEIVE: path.resolve(process.cwd(), "received"),
+  CONFIG_FILE: path.resolve(process.cwd(), "lan-os-config.json"),
+};
+
+if (!fs.existsSync(CONFIG.DIR_RECEIVE))
+  fs.mkdirSync(CONFIG.DIR_RECEIVE, { recursive: true });
+
+// --- HTML GUI (Served directly) ---
+const GUI_HTML = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LAN-OS Messenger</title>
+    <style>
+        :root { --bg: #1e1e1e; --panel: #252526; --accent: #007acc; --text: #d4d4d4; }
+        body { margin: 0; background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; height: 100vh; display: grid; grid-template-columns: 250px 1fr 300px; }
+        
+        /* SIDEBAR (PEERS) */
+        #sidebar { background: var(--panel); border-right: 1px solid #333; padding: 10px; display: flex; flex-direction: column; }
+        h3 { margin: 10px 0 5px; color: #fff; font-size: 14px; text-transform: uppercase; opacity: 0.7; }
+        .list-item { padding: 10px; margin: 2px 0; background: #333; border-radius: 4px; cursor: pointer; transition: 0.2s; display: flex; justify-content: space-between; }
+        .list-item:hover { background: #444; }
+        .list-item.active { background: var(--accent); color: white; }
+        .badge { background: #ff4444; color: white; border-radius: 50%; padding: 2px 6px; font-size: 10px; display: none; }
+
+        /* MAIN CHAT */
+        #main { display: flex; flex-direction: column; height: 100vh; }
+        #chat-header { padding: 15px; background: #2d2d2d; border-bottom: 1px solid #333; font-weight: bold; }
+        #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 8px; }
+        .msg { padding: 8px 12px; border-radius: 6px; max-width: 70%; word-wrap: break-word; }
+        .msg.me { align-self: flex-end; background: var(--accent); color: white; }
+        .msg.them { align-self: flex-start; background: #333; }
+        .sys { align-self: center; font-size: 0.8em; color: #888; font-style: italic; }
+        
+        #input-area { padding: 15px; background: var(--panel); display: flex; gap: 10px; border-top: 1px solid #333; }
+        input { flex: 1; padding: 10px; background: #3c3c3c; border: 1px solid #555; color: white; border-radius: 4px; outline: none; }
+        button { padding: 10px 20px; background: var(--accent); color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { opacity: 0.9; }
+
+        /* GAME PANEL */
+        #game-panel { background: #222; border-left: 1px solid #333; padding: 20px; display: flex; flex-direction: column; align-items: center; }
+        #board { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 20px; pointer-events: none; opacity: 0.5; }
+        .cell { width: 60px; height: 60px; background: #444; display: flex; align-items: center; justify-content: center; font-size: 32px; font-weight: bold; cursor: pointer; border-radius: 4px; }
+        .cell:hover { background: #555; }
+        .cell.X { color: #ff5555; } .cell.O { color: #55aaff; }
+        #game-status { margin-top: 20px; font-weight: bold; text-align: center; }
+        #game-controls { margin-top: 20px; width: 100%; display: flex; flex-direction: column; gap: 10px; }
+        
+        .active-game #board { pointer-events: auto; opacity: 1; }
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <h3>Connected Peers</h3>
+        <div id="peer-list"></div>
+        
+        <h3>Active Chats</h3>
+        <div id="channel-list">
+            <div class="list-item active" onclick="switchChannel('general', '#General')">
+                #General
+                <span class="badge" id="badge-general"></span>
+            </div>
+        </div>
+        
+        <div style="margin-top: auto; font-size: 0.8em; color: #666;">
+            ID: <span id="my-id">...</span><br>
+            Port: <span id="my-port">...</span>
+        </div>
+    </div>
+
+    <div id="main">
+        <div id="chat-header">#General</div>
+        <div id="messages"></div>
+        <div id="input-area">
+            <input type="text" id="msg-input" placeholder="Type a message or /send <file path>...">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+
+    <div id="game-panel">
+        <h3>Tic-Tac-Toe</h3>
+        <div id="game-status">Waiting...</div>
+        <div id="board">
+            <div class="cell" onclick="move(0)" id="c0"></div>
+            <div class="cell" onclick="move(1)" id="c1"></div>
+            <div class="cell" onclick="move(2)" id="c2"></div>
+            <div class="cell" onclick="move(3)" id="c3"></div>
+            <div class="cell" onclick="move(4)" id="c4"></div>
+            <div class="cell" onclick="move(5)" id="c5"></div>
+            <div class="cell" onclick="move(6)" id="c6"></div>
+            <div class="cell" onclick="move(7)" id="c7"></div>
+            <div class="cell" onclick="move(8)" id="c8"></div>
+        </div>
+        <div id="game-controls">
+            <button onclick="inviteGame()" id="btn-invite">Invite to Game</button>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+        const socket = io();
+        let currentChannel = 'general';
+        let myId = '';
+
+        // --- CORE UI LOGIC ---
+        socket.on('init', (data) => {
+            myId = data.id;
+            document.getElementById('my-id').innerText = myId.slice(0, 6);
+            document.getElementById('my-port').innerText = data.port;
+        });
+
+        // Update Peer List
+        socket.on('update-peers', (peers) => {
+            const list = document.getElementById('peer-list');
+            list.innerHTML = '';
+            peers.forEach(p => {
+                const el = document.createElement('div');
+                el.className = 'list-item';
+                el.innerHTML = \`\${p.name} <small>(\${p.device})</small>\`;
+                el.onclick = () => socket.emit('connect-peer', p.id);
+                list.appendChild(el);
+            });
+        });
+
+        // Update Active Channels (DMs)
+        socket.on('update-chats', (chats) => {
+            const list = document.getElementById('channel-list');
+            // Keep General
+            let html = \`<div class="list-item \${currentChannel==='general'?'active':''}" onclick="switchChannel('general', '#General')">#General</div>\`;
+            chats.forEach(c => {
+                html += \`<div class="list-item \${currentChannel===c.id?'active':''}" onclick="switchChannel('\${c.id}', '\${c.name}')">\${c.name}</div>\`;
+            });
+            list.innerHTML = html;
+        });
+
+        function switchChannel(id, name) {
+            currentChannel = id;
+            document.getElementById('chat-header').innerText = name;
+            document.getElementById('messages').innerHTML = ''; // Clear view for demo (in real app, load history)
+            socket.emit('get-history', id); // Optional
+            
+            // Highlight logic
+            document.querySelectorAll('#channel-list .list-item').forEach(el => el.classList.remove('active'));
+            // (Simple re-render would be better, but just hacking classes for now)
+            event.target.classList.add('active');
+        }
+
+        // Handle Messages
+        socket.on('msg', (msg) => {
+            const box = document.getElementById('messages');
+            const div = document.createElement('div');
+            
+            if (msg.type === 'sys') {
+                div.className = 'sys';
+                div.innerText = msg.text;
+            } else {
+                div.className = \`msg \${msg.fromId === myId ? 'me' : 'them'}\`;
+                div.innerHTML = \`<b>\${msg.name}</b>: \${msg.text}\`;
+            }
+            
+            // Only append if viewing that channel or general
+            if (msg.channel === currentChannel) {
+                box.appendChild(div);
+                box.scrollTop = box.scrollHeight;
+            }
+        });
+
+        function sendMessage() {
+            const input = document.getElementById('msg-input');
+            const text = input.value;
+            if (!text) return;
+            
+            socket.emit('send-msg', { channel: currentChannel, text });
+            input.value = '';
+        }
+        
+        document.getElementById('msg-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        // --- GAME LOGIC (Fixed) ---
+        socket.on('game-state', (state) => {
+            const board = document.getElementById('board');
+            const status = document.getElementById('game-status');
+            const btn = document.getElementById('btn-invite');
+            
+            // 1. Update Board Visuals
+            for(let i=0; i<9; i++) {
+                const cell = document.getElementById('c'+i);
+                cell.innerText = state.board[i] || '';
+                cell.className = 'cell ' + (state.board[i] || '');
+            }
+
+            // 2. Active State
+            if (state.active) {
+                document.getElementById('game-panel').classList.add('active-game');
+                status.innerText = \`Turn: \${state.turn}\`;
+                status.style.color = '#fff';
+            } else {
+                document.getElementById('game-panel').classList.remove('active-game');
+                if (state.winner) {
+                    status.innerText = state.winner === 'DRAW' ? 'Draw!' : \`Winner: \${state.winner}!\`;
+                    status.style.color = state.winner === 'DRAW' ? 'yellow' : '#0f0';
+                } else {
+                    status.innerText = 'Idle';
+                }
+            }
+
+            // 3. Button Logic
+            if (state.invitePending) {
+                btn.innerText = "Accept Game Invite";
+                btn.style.background = "#28a745";
+                btn.onclick = acceptGame;
+            } else if (state.active) {
+                btn.innerText = "Game in Progress";
+                btn.style.background = "#555";
+                btn.onclick = null;
+            } else {
+                btn.innerText = "Invite to Game";
+                btn.style.background = "#007acc";
+                btn.onclick = inviteGame;
+            }
+        });
+
+        function inviteGame() { socket.emit('game-action', { action: 'invite', channel: currentChannel }); }
+        function acceptGame() { socket.emit('game-action', { action: 'accept', channel: currentChannel }); }
+        function move(index) { socket.emit('game-action', { action: 'move', channel: currentChannel, index }); }
+
+    </script>
+</body>
+</html>
+`;
+
+// --- GAME LOGIC (Server Side) ---
+class TicTacToe {
+  constructor() {
+    this.reset();
+  }
+  reset() {
+    this.board = Array(9).fill(null);
+    this.turn = "X";
+    this.active = false;
+    this.winner = null;
+    this.players = { X: null, O: null }; // socket IDs
+  }
+  move(idx, playerSym) {
+    if (!this.active || this.board[idx] || this.turn !== playerSym)
+      return false;
+    this.board[idx] = playerSym;
+    this.turn = this.turn === "X" ? "O" : "X";
+    this.checkWin();
+    return true;
+  }
+  checkWin() {
+    const wins = [
+      [0, 1, 2],
+      [3, 4, 5],
+      [6, 7, 8],
+      [0, 3, 6],
+      [1, 4, 7],
+      [2, 5, 8],
+      [0, 4, 8],
+      [2, 4, 6],
+    ];
+    for (let c of wins) {
+      if (
+        this.board[c[0]] &&
+        this.board[c[0]] === this.board[c[1]] &&
+        this.board[c[0]] === this.board[c[2]]
+      ) {
+        this.winner = this.board[c[0]];
+        this.active = false;
+        return;
+      }
+    }
+    if (!this.board.includes(null)) {
+      this.winner = "DRAW";
+      this.active = false;
+    }
+  }
+  getState() {
+    return {
+      board: this.board,
+      turn: this.turn,
+      active: this.active,
+      winner: this.winner,
+    };
+  }
+}
+
+// --- IDENTITY & SETUP ---
+async function setup() {
+  let identity;
+  if (fs.existsSync(CONFIG.CONFIG_FILE)) {
+    identity = JSON.parse(fs.readFileSync(CONFIG.CONFIG_FILE, "utf-8"));
+  } else {
+    console.clear();
+    const ans = await inquirer.prompt([
+      {
+        type: "input",
+        name: "username",
+        message: "Enter Name:",
+        validate: (i) => i.length > 0,
+      },
+    ]);
+    identity = { id: uuidv4(), username: ans.username, device: os.hostname() };
+    fs.writeFileSync(CONFIG.CONFIG_FILE, JSON.stringify(identity, null, 2));
+  }
+  return identity;
+}
+
+// --- MAIN SERVER ---
+(async () => {
+  const identity = await setup();
+  const app = express();
+  const server = http.createServer(app);
+  const io = new Server(server); // Internal GUI communication
+
+  // LAN Networking
+  const peers = new Map();
+  const connections = new Map(); // peerId -> socket (Client)
+  const game = new TicTacToe();
+  let gameInvitePending = false;
+
+  // 1. Host HTML
+  app.get("/", (req, res) => res.send(GUI_HTML));
+
+  // 2. GUI WebSocket (Communication between Browser UI and Node Process)
+  io.on("connection", (uiSocket) => {
+    uiSocket.emit("init", { id: identity.id, port: server.address().port });
+
+    // --- CHAT ---
+    uiSocket.on("send-msg", ({ channel, text }) => {
+      const msgObj = {
+        fromId: identity.id,
+        name: identity.username,
+        text,
+        channel,
+      };
+
+      // Self-echo
+      uiSocket.emit("msg", msgObj);
+
+      if (channel === "general") {
+        // Broadcast to all connected peers
+        connections.forEach((conn) => conn.emit("p2p-msg", msgObj));
+      } else {
+        // Private Message
+        const peer = connections.get(channel);
+        if (peer) peer.emit("p2p-msg", msgObj);
+        else
+          uiSocket.emit("msg", {
+            type: "sys",
+            text: "Peer not connected.",
+            channel,
+          });
+      }
+    });
+
+    // --- CONNECTIONS ---
+    uiSocket.on("connect-peer", (peerId) => {
+      const p = peers.get(peerId);
+      if (!p) return;
+
+      // Create outgoing Socket.io Client connection to Peer
+      const socketToPeer = Client(`http://\${p.address}:\${p.port}`);
+
+      socketToPeer.on("connect", () => {
+        socketToPeer.emit("identify", identity);
+        connections.set(peerId, socketToPeer);
+        updateChats(uiSocket);
+        uiSocket.emit("msg", {
+          type: "sys",
+          text: `Connected to \${p.name}`,
+          channel: "general",
+        });
+      });
+
+      setupP2P(socketToPeer, uiSocket);
+    });
+
+    // --- GAME ACTIONS ---
+    uiSocket.on("game-action", (data) => {
+      const { action, channel, index } = data;
+
+      if (action === "invite") {
+        game.reset();
+        gameInvitePending = false; // I am sender
+        // Send invite over network
+        broadcast(channel, "p2p-game", { action: "invite" });
+        // Update local UI
+        uiSocket.emit("game-state", {
+          ...game.getState(),
+          invitePending: false,
+        });
+      } else if (action === "accept") {
+        game.reset();
+        game.active = true;
+        game.players.O = identity.id; // Acceptor is O
+        gameInvitePending = false;
+        broadcast(channel, "p2p-game", { action: "start" });
+        uiSocket.emit("game-state", {
+          ...game.getState(),
+          invitePending: false,
+        });
+      } else if (action === "move") {
+        // My Symbol logic
+        const mySym = game.players.X === identity.id ? "X" : "O";
+        if (game.move(index, mySym)) {
+          broadcast(channel, "p2p-game", { action: "move", index, sym: mySym });
+          uiSocket.emit("game-state", {
+            ...game.getState(),
+            invitePending: false,
+          });
+        }
+      }
+    });
+
+    // Helper to update active chats in UI
+    const updateChats = (s) => {
+      const list = Array.from(connections.entries()).map(([id, socket]) => {
+        return { id, name: socket.peerName || id.slice(0, 5) };
+      });
+      s.emit("update-chats", list);
+    };
+
+    // Helper to broadcast
+    const broadcast = (channel, event, data) => {
+      if (channel === "general")
+        connections.forEach((c) => c.emit(event, data));
+      else {
+        const c = connections.get(channel);
+        if (c) c.emit(event, data);
+      }
+    };
+  });
+
+  // 3. Incoming P2P Handling (Listening for other nodes)
+  // We reuse the same socket.io server for P2P!
+  io.on("connection", (socket) => {
+    // Check if this is a local GUI or a Remote Peer
+    // We use a custom event 'identify' to distinguish
+    socket.on("identify", (peerIdentity) => {
+      // It's a Peer!
+      socket.peerName = peerIdentity.username;
+      socket.peerId = peerIdentity.id;
+      connections.set(peerIdentity.id, socket);
+
+      // Notify GUI
+      io.emit("msg", {
+        type: "sys",
+        text: `\${peerIdentity.username} joined.`,
+        channel: "general",
+      });
+
+      const list = Array.from(connections.entries()).map(([id, s]) => ({
+        id,
+        name: s.peerName,
+      }));
+      io.emit("update-chats", list);
+
+      setupP2P(socket, io);
+    });
+  });
+
+  function setupP2P(socket, ui) {
+    // Handle incoming chat
+    socket.on("p2p-msg", (msg) => {
+      // If it's general, show in general. If PM (msg.channel == myId), show in sender's channel
+      const dest = msg.channel === "general" ? "general" : msg.fromId;
+      // Inject into GUI
+      ui.emit("msg", { ...msg, channel: dest });
+    });
+
+    // Handle incoming game events
+    socket.on("p2p-game", (data) => {
+      if (data.action === "invite") {
+        gameInvitePending = true;
+        game.players.X = socket.peerId; // Sender is X
+        game.players.O = identity.id; // I am O
+        ui.emit("game-state", { ...game.getState(), invitePending: true });
+      } else if (data.action === "start") {
+        game.reset();
+        game.active = true;
+        game.players.X = identity.id; // I sent invite, so I am X
+        ui.emit("game-state", { ...game.getState(), invitePending: false });
+      } else if (data.action === "move") {
+        game.move(data.index, data.sym);
+        ui.emit("game-state", { ...game.getState(), invitePending: false });
+      }
+    });
+
+    socket.on("disconnect", () => {
+      if (socket.peerId) connections.delete(socket.peerId);
+    });
+  }
+
+  // 4. Start Server & Bonjour
+  const port = CONFIG.PORT_RANGE.min + Math.floor(Math.random() * 500);
+  server.listen(port, "0.0.0.0", () => {
+    console.log(`LAN-OS GUI Running on port ${port}`);
+
+    const bonjour = Bonjour();
+    bonjour.publish({
+      name: identity.username,
+      type: CONFIG.SERVICE_TYPE,
+      port,
+      txt: { id: identity.id },
+    });
+
+    bonjour.find({ type: CONFIG.SERVICE_TYPE }).on("up", (s) => {
+      if (s.txt.id !== identity.id) {
+        peers.set(s.txt.id, {
+          id: s.txt.id,
+          name: s.name,
+          address: s.referer.address,
+          port: s.port,
+        });
+        io.emit("update-peers", Array.from(peers.values()));
+      }
+    });
+
+    // Launch Browser Window
+    open(`http://localhost:${port}`);
+  });
+})();
+
+
+pnpm install express socket.io socket.io-client bonjour uuid open inquirer
