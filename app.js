@@ -18,9 +18,8 @@ const CONFIG = {
   SERVICE_TYPE: "lanos_omega_v12",
   DIR_RECEIVE: path.resolve(process.cwd(), "received_files"),
   CONFIG_FILE: path.resolve(process.cwd(), "lan-identity.json"),
-  // Check often (5s) but don't kill until TIMEOUT (30s)
   PING_INTERVAL: 5000,
-  CONNECTION_TIMEOUT: 30000, // 30 Seconds tolerance
+  CONNECTION_TIMEOUT: 30000,
   CHUNK_SIZE: 16 * 1024,
 };
 
@@ -147,11 +146,9 @@ class NetworkNode extends EventEmitter {
     });
     this.wss = new WebSocketServer({ server });
 
-    // FIX: STABLE HEARTBEAT SYSTEM
     setInterval(() => {
       const now = Date.now();
       this.conns.forEach((c, id) => {
-        // If we haven't heard from them in 30 seconds, THEN kill.
         if (now - c.lastSeen > CONFIG.CONNECTION_TIMEOUT) {
           this.emit(
             "log",
@@ -159,8 +156,6 @@ class NetworkNode extends EventEmitter {
           );
           return c.ws.terminate();
         }
-
-        // Otherwise, send a ping to keep TCP alive
         try {
           c.ws.ping();
         } catch (e) {}
@@ -250,20 +245,17 @@ class NetworkNode extends EventEmitter {
     let peerId = null;
     ws.binaryType = "arraybuffer";
 
-    // FIX: Initialize lastSeen to NOW so it doesn't die immediately
     let connectionData = {
       ws,
       meta: { name: "Unknown" },
       lastSeen: Date.now(),
     };
 
-    // FIX: Update lastSeen on ANY activity (Pong or Message)
     ws.on("pong", () => {
       if (this.conns.has(peerId)) this.conns.get(peerId).lastSeen = Date.now();
     });
 
     ws.on("message", (data, isBinary) => {
-      // Update activity timestamp
       if (peerId && this.conns.has(peerId)) {
         this.conns.get(peerId).lastSeen = Date.now();
       }
@@ -280,16 +272,13 @@ class NetworkNode extends EventEmitter {
         switch (type) {
           case "pair":
             peerId = payload.fromId;
-            // Update connection map with real ID and Name
             connectionData.meta = payload;
             this.conns.set(peerId, connectionData);
-
             this.emit("conns_update");
             this.emit(
               "log",
               `${COLORS.me}Linked with ${payload.name}${COLORS.reset}`
             );
-
             if (!payload.ack)
               this._send(ws, "pair", {
                 fromId: this.identity.id,
@@ -297,12 +286,15 @@ class NetworkNode extends EventEmitter {
                 ack: true,
               });
             break;
+
           case "msg":
             this.emit("chat", payload);
             break;
+
           case "nudge":
             this.emit("nudge_event", payload.fromName);
             break;
+
           case "shell-req":
             this.pendingShell = { fromId: payload.fromId, cmd: payload.cmd };
             this.emit(
@@ -314,17 +306,28 @@ class NetworkNode extends EventEmitter {
               `Type ${COLORS.cmd}/allow${COLORS.reset} to execute or ignore to deny.`
             );
             break;
+
           case "shell-out":
             this.emit(
               "log",
               `${COLORS.cmd}[REMOTE OUTPUT]:${COLORS.reset}\n${payload.output}`
             );
             break;
+
+          // --- UPDATED FILE HANDLING START ---
           case "file-offer":
+            const isPm = payload.isPm !== false;
+            const prefix = isPm
+              ? `${COLORS.dm}[DM ${payload.fromName}]`
+              : `${COLORS.gen}[#Gen ${payload.fromName}]`;
+
             this.emit(
               "log",
-              `${COLORS.file}Receiving file: ${payload.filename}${COLORS.reset}`
+              `${prefix} ${COLORS.file}Receiving: ${payload.filename} (${(
+                payload.size / 1024
+              ).toFixed(1)}kb)${COLORS.reset}`
             );
+
             const fpath = path.join(
               CONFIG.DIR_RECEIVE,
               `${Date.now()}_${payload.filename}`
@@ -332,19 +335,25 @@ class NetworkNode extends EventEmitter {
             this.transfers.set(payload.fileId, {
               stream: fs.createWriteStream(fpath),
               path: fpath,
+              fromName: payload.fromName,
             });
             break;
+
           case "file-end":
             const t = this.transfers.get(payload.fileId);
             if (t) {
               t.stream.end();
               this.emit(
                 "log",
-                `${COLORS.me}File Saved: ${t.path}${COLORS.reset}`
+                `${COLORS.me}File Saved from ${t.fromName}: ${path.basename(
+                  t.path
+                )}${COLORS.reset}`
               );
               this.transfers.delete(payload.fileId);
             }
             break;
+          // --- UPDATED FILE HANDLING END ---
+
           case "game-invite":
             this.emit(
               "log",
@@ -391,9 +400,7 @@ class NetworkNode extends EventEmitter {
       }
     });
 
-    ws.on("error", (e) => {
-      // Silently handle errors, let close event handle cleanup
-    });
+    ws.on("error", (e) => {});
   }
 
   _send(ws, type, payload) {
@@ -453,7 +460,7 @@ class NetworkNode extends EventEmitter {
   _showHelp() {
     const help = [
       `{bold}LAN-OS COMMANDS:{/}`,
-      `  /send <path>   : Send a file`,
+      `  /send <path>   : Send file (to DM or All)`,
       `  /nudge         : Shake opponent's screen`,
       `  /play          : Invite to Tic-Tac-Toe`,
       `  /accept        : Accept Game Invite`,
@@ -510,39 +517,86 @@ class NetworkNode extends EventEmitter {
     this.pendingShell = null;
   }
 
+  // --- UPDATED SEND FILE LOGIC ---
   _sendFile(filePath) {
     if (!fs.existsSync(filePath))
       return this.emit("log", `${COLORS.err}File not found.${COLORS.reset}`);
-    const target =
-      this.activeTarget === "general"
-        ? null
-        : this.conns.get(this.activeTarget);
-    if (!target)
-      return this.emit(
-        "log",
-        `${COLORS.err}Select a DM to send files.${COLORS.reset}`
-      );
+
+    // 1. Determine Targets
+    let targets = [];
+    const isGeneral = this.activeTarget === "general";
+
+    if (isGeneral) {
+      this.conns.forEach((c) => targets.push(c));
+      if (targets.length === 0) {
+        return this.emit(
+          "log",
+          `${COLORS.err}No peers online to receive broadcast.${COLORS.reset}`
+        );
+      }
+    } else {
+      const t = this.conns.get(this.activeTarget);
+      if (!t)
+        return this.emit(
+          "log",
+          `${COLORS.err}Target disconnected.${COLORS.reset}`
+        );
+      targets.push(t);
+    }
+
+    // 2. Prepare File Data
     const fileId = uuidv4();
     const stats = fs.statSync(filePath);
     const filename = path.basename(filePath);
-    this._send(target.ws, "file-offer", {
-      fileId,
-      filename,
-      size: stats.size,
-      fromId: this.identity.id,
+
+    this.emit(
+      "log",
+      `${COLORS.me}Sending file: ${filename} to ${
+        isGeneral ? "#General" : targets[0].meta.name
+      }...${COLORS.reset}`
+    );
+
+    // 3. Send Offer
+    targets.forEach((t) => {
+      this._send(t.ws, "file-offer", {
+        fileId,
+        filename,
+        size: stats.size,
+        fromId: this.identity.id,
+        fromName: this.identity.username,
+        isPm: !isGeneral,
+      });
     });
+
+    // 4. Stream
     const stream = fs.createReadStream(filePath, {
       highWaterMark: CONFIG.CHUNK_SIZE,
     });
+
     stream.on("data", (chunk) => {
-      if (target.ws.readyState === WebSocket.OPEN)
-        target.ws.send(Protocol.createBinary(fileId, chunk));
+      const binaryPacket = Protocol.createBinary(fileId, chunk);
+      targets.forEach((t) => {
+        if (t.ws.readyState === WebSocket.OPEN) {
+          t.ws.send(binaryPacket);
+        }
+      });
     });
+
     stream.on("end", () => {
-      this._send(target.ws, "file-end", { fileId });
-      this.emit("log", `${COLORS.me}Sent file: ${filename}${COLORS.reset}`);
+      targets.forEach((t) => {
+        this._send(t.ws, "file-end", { fileId, filename });
+      });
+      this.emit("log", `${COLORS.me}Transfer Complete.${COLORS.reset}`);
+    });
+
+    stream.on("error", (err) => {
+      this.emit(
+        "log",
+        `${COLORS.err}Read Error: ${err.message}${COLORS.reset}`
+      );
     });
   }
+  // --- END UPDATED SEND FILE LOGIC ---
 
   _invite() {
     const t = this.conns.get(this.activeTarget);
